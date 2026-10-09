@@ -10,3 +10,10 @@ export const BOOK_SIZES: BookSize[] = [
 ]
 
 export const MAX_PAGES = 50
+
+export function coverSpread(size: BookSize, orientation: 'portrait' | 'landscape', pageCount: number) {
+  const widthMm = orientation === 'portrait' ? size.widthMm : size.heightMm
+  const heightMm = orientation === 'portrait' ? size.heightMm : size.widthMm
+  const spineMm = Math.max(8, Math.round(pageCount * 0.12 * 10) / 10)
+  return { widthMm, heightMm, spineMm, spreadMm: widthMm * 2 + spineMm }
+}

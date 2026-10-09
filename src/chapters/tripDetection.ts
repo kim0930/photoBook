@@ -30,7 +30,11 @@ function estimateHome(photos: Photo[]): [number, number] | undefined {
   return home ? [home.lat, home.lon] : undefined
 }
 
-async function placeName(lat: number, lon: number): Promise<string> {
+export function cachedPlace(lat: number, lon: number) {
+  return localStorage.getItem(`place:${lat.toFixed(2)},${lon.toFixed(2)}`) ?? ''
+}
+
+export async function placeName(lat: number, lon: number): Promise<string> {
   const cacheKey = `place:${lat.toFixed(2)},${lon.toFixed(2)}`
   const cached = localStorage.getItem(cacheKey)
   if (cached) return cached
@@ -108,9 +112,54 @@ export async function buildChapters(photos: Photo[], thresholdKm = 50): Promise<
     }),
   )
 
-  return [...monthChapters, ...trips].sort((a, b) => {
-    const aDate = photos.find((p) => p.id === a.photoIds[0])?.capturedAt ?? ''
-    const bDate = photos.find((p) => p.id === b.photoIds[0])?.capturedAt ?? ''
-    return aDate.localeCompare(bDate)
-  })
+  return ensureMonthChapters(photos, [...monthChapters, ...trips])
+}
+
+export function ensureMonthChapters(photos: Photo[], chapters: Chapter[]) {
+  const photoIds = new Set(photos.map((photo) => photo.id))
+  const next = chapters.map((chapter) => ({
+    ...chapter,
+    photoIds: chapter.photoIds.filter((id) => {
+      const photo = photos.find((item) => item.id === id)
+      return photo && !photo.omitted
+    }),
+  }))
+  for (const chapter of next) {
+    if (chapter.coverPhotoId && !photoIds.has(chapter.coverPhotoId)) chapter.coverPhotoId = chapter.photoIds[0]
+  }
+  const byMonth = new Map<number, Photo[]>()
+  for (const photo of [...photos].sort((a, b) => a.capturedAt.localeCompare(b.capturedAt))) {
+    const date = new Date(photo.capturedAt)
+    if (Number.isNaN(date.getTime()) || photo.omitted) continue
+    const month = date.getMonth() + 1
+    const group = byMonth.get(month) ?? []
+    group.push(photo)
+    byMonth.set(month, group)
+  }
+  for (const [month, monthPhotos] of byMonth) {
+    let chapter = next.find((item) => item.type === 'month' && item.month === month)
+    if (!chapter) {
+      chapter = {
+        id: `month-${month}`,
+        type: 'month',
+        month,
+        title: `${month}월`,
+        photoIds: [],
+        note: '',
+      }
+      next.push(chapter)
+    }
+    const included = new Set(chapter.photoIds)
+    for (const photo of monthPhotos) {
+      if (!included.has(photo.id)) chapter.photoIds.push(photo.id)
+    }
+    if (!chapter.coverPhotoId) chapter.coverPhotoId = chapter.photoIds[0]
+  }
+  return next
+    .filter((chapter) => chapter.photoIds.length > 0)
+    .sort((a, b) => {
+      const aDate = photos.find((photo) => photo.id === a.photoIds[0])?.capturedAt ?? ''
+      const bDate = photos.find((photo) => photo.id === b.photoIds[0])?.capturedAt ?? ''
+      return aDate.localeCompare(bDate)
+    })
 }

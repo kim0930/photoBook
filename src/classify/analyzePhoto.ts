@@ -28,8 +28,26 @@ function sceneFromTags(tags: string[], personCount: number, landscapeLikelihood:
   return 'other'
 }
 
+export function analyzeBitmap(bitmap: ImageBitmap): PhotoAnalysis {
+  const canvas = analysisCanvas(bitmap)
+  const context = canvas.getContext('2d', { willReadFrequently: true })
+  if (!context) throw new Error('사진 분석 캔버스를 만들 수 없습니다.')
+  return buildAnalysis(canvas, visualFeatures(context.getImageData(0, 0, canvas.width, canvas.height)), [], false)
+}
+
 export async function analyzePhoto(blob: Blob): Promise<PhotoAnalysis> {
   const bitmap = await createImageBitmap(blob)
+  const canvas = analysisCanvas(bitmap)
+  bitmap.close()
+  const context = canvas.getContext('2d', { willReadFrequently: true })
+  if (!context) throw new Error('사진 분석 캔버스를 만들 수 없습니다.')
+  const visual = visualFeatures(context.getImageData(0, 0, canvas.width, canvas.height))
+  const model = await getModel()
+  const detections = model ? await model.detect(canvas, 12, 0.42) : []
+  return buildAnalysis(canvas, visual, detections, Boolean(model))
+}
+
+function analysisCanvas(bitmap: ImageBitmap) {
   const maxEdge = 384
   const scale = Math.min(1, maxEdge / Math.max(bitmap.width, bitmap.height))
   const canvas = document.createElement('canvas')
@@ -38,12 +56,15 @@ export async function analyzePhoto(blob: Blob): Promise<PhotoAnalysis> {
   const context = canvas.getContext('2d', { willReadFrequently: true })
   if (!context) throw new Error('사진 분석 캔버스를 만들 수 없습니다.')
   context.drawImage(bitmap, 0, 0, canvas.width, canvas.height)
-  bitmap.close()
+  return canvas
+}
 
-  const pixels = context.getImageData(0, 0, canvas.width, canvas.height)
-  const visual = visualFeatures(pixels)
-  const model = await getModel()
-  const detections = model ? await model.detect(canvas, 12, 0.42) : []
+function buildAnalysis(
+  canvas: HTMLCanvasElement,
+  visual: ReturnType<typeof visualFeatures>,
+  detections: Array<{ class: string; score: number; bbox: number[] }>,
+  detailed: boolean,
+): PhotoAnalysis {
   const people = detections.filter((item) => item.class === 'person' && item.score >= 0.48)
   const tags = [...new Set(detections.filter((item) => item.score >= 0.48).map((item) => item.class))]
   const focalPoint = people.length
@@ -79,6 +100,10 @@ export async function analyzePhoto(blob: Blob): Promise<PhotoAnalysis> {
     dominantColor: visual.dominantColor,
     focalPoint: { x: clamp(focalPoint.x), y: clamp(focalPoint.y) },
     tags,
+    detailed,
+    saturation: visual.saturation,
+    edgeDensity: visual.edgeDensity,
+    documentCandidate: visual.saturation < 0.22 && visual.edgeDensity > 0.1 && people.length === 0 && visual.brightness > 0.55,
   }
 }
 
@@ -96,6 +121,7 @@ function visualFeatures(image: ImageData) {
   let red = 0
   let green = 0
   let blue = 0
+  let saturation = 0
   let focalWeight = 0
   let focalX = 0
   let focalY = 0
@@ -113,6 +139,8 @@ function visualFeatures(image: ImageData) {
       red += r
       green += g
       blue += b
+      const channelMax = Math.max(r, g, b)
+      saturation += channelMax === 0 ? 0 : (channelMax - Math.min(r, g, b)) / channelMax
       if ((g > r * 1.05 && g > b * 0.9) || (b > r * 1.08 && b > g * 0.92)) nature += 1
       if (y < height * 0.42 && b > r * 1.08 && b > g * 1.02) skyTop += 1
       if (x + sampleStep < width) {
@@ -135,6 +163,8 @@ function visualFeatures(image: ImageData) {
     brightness: average,
     contrast: clamp(Math.sqrt(Math.max(0, variance / count - average * average)) * 3.2),
     sharpness: clamp((edge / count) * 3.8),
+    saturation: saturation / count,
+    edgeDensity: edge / count,
     natureRatio: nature / count,
     skyTopRatio: skyTop / Math.max(1, count * 0.42),
     dominantColor: color,
