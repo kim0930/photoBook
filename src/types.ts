@@ -2,7 +2,7 @@ export type PhotoSize = 'small' | 'medium' | 'large'
 export type SceneType = 'people' | 'landscape' | 'food' | 'animal' | 'architecture' | 'other'
 
 export type ExcludeReason = 'blur' | 'screenshot' | 'document' | 'duplicate' | 'lowres'
-export type HoldReason = 'budget' | 'date' | 'face'
+export type HoldReason = 'budget' | 'date' | 'face' | 'people'
 
 export interface PhotoAnalysis {
   scene: SceneType
@@ -101,6 +101,8 @@ export interface FaceGroup {
 export interface CurationSettings {
   faceGroupsEnabled: boolean
   hiddenRanges: HiddenRange[]
+  /** 비어 있지 않으면 이 얼굴 그룹에 속한 사진만 책에 넣음 */
+  focusFaceIds?: string[]
   signalsVersion?: number
 }
 
@@ -115,7 +117,7 @@ export type FlowAspect = 'locked' | 'free'
 export interface BookPage {
   id: string
   chapterId: string
-  type: 'intro' | 'photos' | 'map'
+  type: 'intro' | 'photos' | 'map' | 'year-months' | 'year-map'
   photoIds: string[]
   layoutId?: string
   flowAspect?: FlowAspect
@@ -148,6 +150,35 @@ export interface DrawStroke {
   points: { x: number; y: number }[]
 }
 
+export interface PageSticker {
+  id: string
+  emoji: string
+  x: number
+  y: number
+  size: number
+  rotation?: number
+}
+
+export interface PageMapWidget {
+  id: string
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+export type CoverPanel = 'front' | 'back' | 'spine'
+
+export interface CoverSticker {
+  id: string
+  panel: CoverPanel
+  emoji: string
+  x: number
+  y: number
+  size: number
+  rotation?: number
+}
+
 export interface BookCoverDesign {
   title: string
   subtitle: string
@@ -157,6 +188,10 @@ export interface BookCoverDesign {
   textColor: string
   frontPhotoId?: string
   backPhotoId?: string
+  spinePhotoId?: string
+  titleSize?: number
+  subtitleSize?: number
+  stickers?: CoverSticker[]
 }
 
 export interface BookSize {

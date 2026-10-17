@@ -2,6 +2,10 @@ import { bookPhoto } from '../curate/bookSelection'
 import { MAX_PAGES } from '../settings/bookSize'
 import type { BookPage, Chapter, Photo } from '../types'
 
+export const YEAR_CHAPTER_ID = 'year-book'
+export const YEAR_MONTHS_PAGE_ID = 'book-year-months'
+export const YEAR_MAP_PAGE_ID = 'book-year-map'
+
 const WEIGHTS = { small: 0.65, medium: 1, large: 1.7 }
 export type LayoutId =
   | 'solo-bleed'
@@ -44,10 +48,99 @@ export function photosPerPage(photos: Photo[]) {
   return Math.max(2, Math.min(8, Math.round(6 / weight)))
 }
 
+export function makeYearChapter(photos: Photo[], chapters: Chapter[] = []): Chapter {
+  const monthHeroes = pickMonthHeroes(photos, chapters)
+  return {
+    id: YEAR_CHAPTER_ID,
+    type: 'month',
+    title: '한 해의 기록',
+    photoIds: monthHeroes.map((photo) => photo.id),
+    note: '',
+  }
+}
+
+/** 월 챕터 대표(coverPhotoId)를 우선하고, 없으면 그달 최고 점수 사진을 쓴다. */
+export function pickMonthHeroes(photos: Photo[], chapters: Chapter[] = []) {
+  const byId = new Map(photos.map((photo) => [photo.id, photo]))
+  const coverByMonth = new Map<number, Photo>()
+  for (const chapter of chapters) {
+    if (chapter.id === YEAR_CHAPTER_ID || chapter.type !== 'month' || !chapter.month) continue
+    const cover = byId.get(chapter.coverPhotoId ?? '')
+    if (bookPhoto(cover)) coverByMonth.set(chapter.month, cover)
+  }
+
+  const byMonth = new Map<number, Photo[]>()
+  for (const photo of photos.filter(bookPhoto)) {
+    const date = new Date(photo.capturedAt)
+    if (Number.isNaN(date.getTime())) continue
+    const month = date.getMonth() + 1
+    const list = byMonth.get(month) ?? []
+    list.push(photo)
+    byMonth.set(month, list)
+  }
+  const heroes: Photo[] = []
+  for (let month = 1; month <= 12; month += 1) {
+    const covered = coverByMonth.get(month)
+    if (covered) {
+      heroes.push(covered)
+      continue
+    }
+    const list = byMonth.get(month)
+    if (!list?.length) continue
+    heroes.push([...list].sort((a, b) => photoScore(b) - photoScore(a))[0])
+  }
+  return heroes
+}
+
+/** 가까운 좌표끼리 묶어 장소별 대표 사진 */
+export function pickPlaceHeroes(photos: Photo[], max = 28) {
+  const buckets = new Map<string, Photo[]>()
+  for (const photo of photos.filter(bookPhoto)) {
+    if (photo.latitude == null || photo.longitude == null) continue
+    const key = `${photo.latitude.toFixed(2)},${photo.longitude.toFixed(2)}`
+    const list = buckets.get(key) ?? []
+    list.push(photo)
+    buckets.set(key, list)
+  }
+  return [...buckets.values()]
+    .map((list) => [...list].sort((a, b) => photoScore(b) - photoScore(a))[0])
+    .sort((a, b) => a.capturedAt.localeCompare(b.capturedAt))
+    .slice(0, max)
+}
+
+export function buildYearFrontPages(photos: Photo[], chapters: Chapter[] = []): BookPage[] {
+  const monthHeroes = pickMonthHeroes(photos, chapters)
+  const placeHeroes = pickPlaceHeroes(photos)
+  if (!monthHeroes.length && !placeHeroes.length) return []
+  const pages: BookPage[] = []
+  if (monthHeroes.length) {
+    pages.push({
+      id: YEAR_MONTHS_PAGE_ID,
+      chapterId: YEAR_CHAPTER_ID,
+      type: 'year-months',
+      photoIds: monthHeroes.map((photo) => photo.id),
+    })
+  }
+  pages.push({
+    id: YEAR_MAP_PAGE_ID,
+    chapterId: YEAR_CHAPTER_ID,
+    type: 'year-map',
+    photoIds: placeHeroes.map((photo) => photo.id),
+  })
+  return pages
+}
+
+export function ensureYearFrontPages(pages: BookPage[], photos: Photo[], chapters: Chapter[] = []): BookPage[] {
+  const front = buildYearFrontPages(photos, chapters)
+  const rest = pages.filter((page) => page.type !== 'year-months' && page.type !== 'year-map')
+  return front.length ? [...front, ...rest] : rest
+}
+
 export function buildPages(chapters: Chapter[], photos: Photo[], revision = 0): BookPage[] {
   const byId = new Map(photos.map((photo) => [photo.id, photo]))
   const groups: BookPage[][] = []
   for (const chapter of chapters) {
+    if (chapter.id === YEAR_CHAPTER_ID) continue
     const kept = chapter.photoIds.map((id) => byId.get(id)).filter(bookPhoto)
     if (!kept.length) continue
     const cover = bookPhoto(byId.get(chapter.coverPhotoId ?? '')) ? chapter.coverPhotoId : kept[0].id
@@ -89,7 +182,10 @@ export function buildPages(chapters: Chapter[], photos: Photo[], revision = 0): 
     }
     groups.push(pages)
   }
-  return limitChapterPages(groups, MAX_PAGES)
+  const front = buildYearFrontPages(photos, chapters)
+  const reserve = front.length
+  const body = limitChapterPages(groups, Math.max(1, MAX_PAGES - reserve))
+  return [...front, ...body]
 }
 
 function limitChapterPages(groups: BookPage[][], max: number) {
@@ -150,38 +246,54 @@ export function computeAdaptiveLayout(
 ): AdaptiveRect[] {
   const result = new Map<string, AdaptiveRect>()
 
+  /** 페이지 정규화 좌표에서 사진의 가로/세로비 (width/height) */
+  function normAspect(photo: Photo) {
+    const rotation = ((photo.rotation ?? 0) % 360 + 360) % 360
+    const swapped = rotation === 90 || rotation === 270
+    const photoRatio = Math.max(
+      0.08,
+      (swapped ? photo.height : photo.width) / Math.max(1, swapped ? photo.width : photo.height),
+    )
+    return photoRatio / Math.max(pageRatio, 0.08)
+  }
+
+  function leafScore(photo: Photo, rect: AdaptiveRect) {
+    const target = normAspect(photo)
+    const actual = rect.width / Math.max(rect.height, 0.001)
+    const mismatch = Math.abs(Math.log(actual / target))
+    return mismatch * mismatch
+  }
+
+  /** 비율을 맞추는 분할로 페이지를 빈틈없이 채움 */
   function solve(items: Photo[], rect: AdaptiveRect): { score: number; entries: Array<[string, AdaptiveRect]> } | undefined {
     if (!items.length) return
     if (items.length === 1) {
-      const slotRatio = (rect.width * pageRatio) / Math.max(rect.height, 0.001)
-      const photoRatio = items[0].width / items[0].height
-      const visibleFraction = Math.min(slotRatio / photoRatio, photoRatio / slotRatio)
-      const crop = 1 - visibleFraction
       return {
-        score: crop <= 0.15 ? crop : 0.15 + (crop - 0.15) * 7,
+        score: leafScore(items[0], rect),
         entries: [[items[0].id, rect]],
       }
     }
-    const weights = items.map((photo) => Math.max(0.35, photo.layoutWeight ?? WEIGHTS[photo.size]))
-    const total = weights.reduce((sum, value) => sum + value, 0)
-    let accumulated = 0
+
+    const aspects = items.map((photo) => normAspect(photo))
     let best: { score: number; entries: Array<[string, AdaptiveRect]> } | undefined
+
     for (let splitIndex = 1; splitIndex < items.length; splitIndex += 1) {
-      accumulated += weights[splitIndex - 1]
-      const fraction = accumulated / total
       const first = items.slice(0, splitIndex)
       const second = items.slice(splitIndex)
+      const arFirst = aspects.slice(0, splitIndex).reduce((sum, value) => sum + value, 0)
+      const arSecond = aspects.slice(splitIndex).reduce((sum, value) => sum + value, 0)
+      const invFirst = aspects.slice(0, splitIndex).reduce((sum, value) => sum + 1 / value, 0)
+      const invSecond = aspects.slice(splitIndex).reduce((sum, value) => sum + 1 / value, 0)
+
       const candidates: Array<[AdaptiveRect, AdaptiveRect]> = [
-        [
-          { ...rect, width: rect.width * fraction },
-          { x: rect.x + rect.width * fraction, y: rect.y, width: rect.width * (1 - fraction), height: rect.height },
-        ],
-        [
-          { ...rect, height: rect.height * fraction },
-          { x: rect.x, y: rect.y + rect.height * fraction, width: rect.width, height: rect.height * (1 - fraction) },
-        ],
+        // 좌우: 같은 높이, 가로는 비율 합에 비례 → 한 줄 배치에 최적
+        splitPair(rect, arFirst / (arFirst + arSecond), true),
+        // 상하: 같은 너비, 세로는 역비율 합에 비례 → 세로 쌓기에 최적
+        splitPair(rect, invFirst / (invFirst + invSecond), false),
       ]
+
       for (const [firstRect, secondRect] of candidates) {
+        if (firstRect.width < 0.04 || firstRect.height < 0.04 || secondRect.width < 0.04 || secondRect.height < 0.04) continue
         const firstResult = solve(first, firstRect)
         const secondResult = solve(second, secondRect)
         if (!firstResult || !secondResult) continue

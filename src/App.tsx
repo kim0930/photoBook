@@ -1,12 +1,14 @@
 import {
-  BookOpen, ChevronLeft, ChevronRight, ChevronsLeft, Download, FolderOpen, Home, ImagePlus, Pencil,
+  BookOpen, Check, ChevronLeft, ChevronRight, ChevronsLeft, Download, FolderOpen, Home, ImagePlus, LogOut, Pencil,
   Crop, Grip, LayoutTemplate, Lock, MapPinned, Maximize2, Minus, Mountain, Plus, RotateCcw, RotateCw, Settings2, Sparkles,
   Trash2, Upload, Users, WandSparkles, X,
 } from 'lucide-react'
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { flushSync } from 'react-dom'
+import { useShallow } from 'zustand/react/shallow'
 import 'leaflet/dist/leaflet.css'
 import './App.css'
+import { useAuth } from './auth/AuthContext'
 import { buildChapters, cachedPlace, placeName } from './chapters/tripDetection'
 import { analyzePhoto } from './classify/analyzePhoto'
 import { LivePhotoPicker } from './components/LivePhotoPicker'
@@ -15,13 +17,17 @@ import { TripMap } from './components/TripMap'
 import { groupFaces } from './curate/faces'
 import { scanDocuments } from './curate/ocr'
 import { SIGNALS_VERSION, curatePhotos, scoreQuality } from './curate/signals'
-import { loadCover, loadCurationSettings, loadDrawings, loadFaceGroups, loadLibrary, loadPageCaptions, loadPageNotes, saveCurationSettings, savePageNotes } from './db'
+import {
+  attachPhotoBinaries, attachPhotoBinary, createBook, deleteBook, getActiveBookId, listBooks, loadBookWorkspace,
+  revokePhotoUrls, saveCurationSettings, savePageNotes, setActiveBookId, syncBookMetaFromPhotos, type BookListItem,
+} from './db'
+import { STICKER_EMOJIS } from './stickers'
 import { exportBookPdf, preparePrintUrls, revokePrintUrls, waitForExportImages } from './export/pdf'
 import { chooseDirectoryFiles, scanFiles } from './import/scanFolder'
-import { availableLayouts, computeAdaptiveLayout, findPhotoGutters, type LayoutId, type PhotoGutter } from './layout/autoLayout'
+import { availableLayouts, computeAdaptiveLayout, findPhotoGutters, YEAR_CHAPTER_ID, type LayoutId, type PhotoGutter } from './layout/autoLayout'
 import { BOOK_SIZES, MAX_PAGES, coverSpread } from './settings/bookSize'
-import { useBookStore } from './store'
-import type { BookPage, Chapter, ExcludeReason, HoldReason, ImportProgress, PageCaption, PageNote, Photo, PhotoFrame } from './types'
+import { EMPTY_COVER, useBookStore } from './store'
+import type { BookPage, Chapter, CoverPanel, CoverSticker, ExcludeReason, HoldReason, ImportProgress, PageCaption, PageMapWidget, PageNote, PageSticker, Photo, PhotoFrame } from './types'
 
 const THUMB_SIZES = [56, 72, 88, 108, 132]
 const TEMPLATE_SIZES = [68, 88, 108, 132, 160]
@@ -40,13 +46,12 @@ function storedNumber(key: string, fallback: number) {
 }
 
 const CURRENT_YEAR = new Date().getFullYear()
-const EARLIEST_YEAR = 1970
-const YEAR_OPTIONS = Array.from({ length: CURRENT_YEAR - EARLIEST_YEAR + 1 }, (_, index) => CURRENT_YEAR - index)
 
 function App() {
-  const store = useBookStore()
+  const { user, signOutUser } = useAuth()
+  // drawings/history는 편집 중 자주 바뀌므로 App 전체 리렌더에서 제외
+  const store = useBookStore(useShallow(({ drawings: _d, history: _h, ...rest }) => rest))
   const setLibrary = useBookStore((state) => state.setLibrary)
-  const [year, setYear] = useState(CURRENT_YEAR)
   const [progress, setProgress] = useState<ImportProgress>()
   const [importError, setImportError] = useState('')
   const [livePhoto, setLivePhoto] = useState<Photo>()
@@ -65,7 +70,10 @@ function App() {
   const [printUrls, setPrintUrls] = useState<Record<string, string>>({})
   const [customSize, setCustomSize] = useState({ widthMm: 210, heightMm: 297 })
   const [restoring, setRestoring] = useState(true)
-  const [showWelcome, setShowWelcome] = useState(false)
+  const [showWelcome, setShowWelcome] = useState(true)
+  const [bookList, setBookList] = useState<BookListItem[]>([])
+  const [openingBookId, setOpeningBookId] = useState<string>()
+  const [deletingBookId, setDeletingBookId] = useState<string>()
   const [thumbSize, setThumbSize] = useState(() => storedNumber('photobook-thumb-size', DEFAULT_THUMB))
   const [templateSize, setTemplateSize] = useState(() => {
     const stored = storedNumber('photobook-template-size', DEFAULT_TEMPLATE)
@@ -74,45 +82,217 @@ function App() {
   const [trayWidth, setTrayWidth] = useState(() => storedNumber('photobook-tray-width', trayWidthForColumns(DEFAULT_THUMB)))
   const [coverMode, setCoverMode] = useState(false)
   const [drawMode, setDrawMode] = useState(false)
+  const [stickerPicker, setStickerPicker] = useState<'page' | CoverPanel | null>(null)
   const [penColor, setPenColor] = useState('#2b2824')
   const [penSize, setPenSize] = useState(1.2)
+  const [trayDragging, setTrayDragging] = useState(false)
+  const [trashHot, setTrashHot] = useState(false)
+  const [traySelected, setTraySelected] = useState<string[]>([])
+  const [trayPreviewId, setTrayPreviewId] = useState<string | undefined>()
+  const [deleteConfirm, setDeleteConfirm] = useState<{ ids: string[]; title: string; body: string } | null>(null)
   const canvasRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   const addInputRef = useRef<HTMLInputElement>(null)
   const trayListRef = useRef<HTMLDivElement>(null)
   const pageListRef = useRef<HTMLDivElement>(null)
+  const trayAnchorRef = useRef<string | null>(null)
+  const marqueeBoxRef = useRef<HTMLDivElement>(null)
+  const marqueeRafRef = useRef(0)
+  const marqueeKeyRef = useRef('')
+  const marqueeRef = useRef<{
+    pointerId: number
+    originX: number
+    originY: number
+    additive: boolean
+    baseline: Set<string>
+    currentIds: string[]
+  } | null>(null)
 
   const selectedIndex = Math.max(0, store.pages.findIndex((page) => page.id === store.selectedPageId))
   const selectedPage = store.pages[selectedIndex]
   const selectedChapter = store.chapters.find((chapter) => chapter.id === selectedPage?.chapterId)
-  const pagePlacements = pagePlacementByPhoto(store.pages)
+  const pagePlacements = useMemo(() => pagePlacementByPhoto(store.pages), [store.pages])
+  const trayEntries = useMemo(() => libraryEntries(store.photos), [store.photos])
+  const traySelectedSet = useMemo(() => new Set(traySelected), [traySelected])
+  const onCanvasIds = useMemo(() => new Set(selectedPage?.photoIds ?? []), [selectedPage?.photoIds])
+  const pageCompleted = Boolean(selectedPage && store.completedPages[selectedPage.id])
+  const bookYear = store.photos.length ? bookYearFromPhotos(store.photos) : CURRENT_YEAR
+  const bookPeriod = store.photos.length ? existingBookPeriod(store.photos) : ''
+
+  async function refreshBookList() {
+    const next = await listBooks()
+    setBookList((previous) => {
+      for (const item of previous) {
+        if (item.coverThumbUrl?.startsWith('blob:')) {
+          try { URL.revokeObjectURL(item.coverThumbUrl) } catch { /* ignore */ }
+        }
+      }
+      return next
+    })
+  }
+
+  function emptyEditorState() {
+    return {
+      photos: [] as Photo[],
+      chapters: [] as Chapter[],
+      pages: [],
+      pageNotes: {},
+      drawings: {},
+      pageCaptions: {},
+      pageStickers: {},
+      pageMaps: {},
+      cover: EMPTY_COVER,
+      completedPages: {},
+      faceGroups: [],
+      curation: { faceGroupsEnabled: false, hiddenRanges: [], focusFaceIds: [] },
+      history: [],
+      layoutRevision: 0,
+      layoutOverrides: {},
+      flowAspectModes: {},
+      selectedPageId: undefined as string | undefined,
+    }
+  }
 
   useEffect(() => {
-    let active = true
-    void Promise.all([loadLibrary(), loadPageNotes(), loadDrawings(), loadCover(), loadPageCaptions(), loadCurationSettings(), loadFaceGroups()])
-      .then(async ([library, pageNotes, drawings, cover, pageCaptions, curation, faceGroups]) => {
-        if (!active) return
-        const memos = Object.fromEntries(Object.entries(pageNotes).map(([pageId, notes]) => {
-          const kept = notes.filter((note) => note.kind === 'memo')
-          if (kept.length !== notes.length) void savePageNotes(pageId, kept)
-          return [pageId, kept]
-        }))
-        let photos = library.photos
-        let nextCuration = curation
-        if (photos.length && (curation.signalsVersion ?? 0) < SIGNALS_VERSION) {
-          photos = await curatePhotos(photos)
-          if (!active) return
-          nextCuration = { ...curation, signalsVersion: SIGNALS_VERSION }
-          await saveCurationSettings(nextCuration)
-        }
-        useBookStore.setState({ pageNotes: memos, drawings, pageCaptions, curation: nextCuration, faceGroups, ...(cover ? { cover } : {}) })
-        if (photos.length && library.chapters.length) setLibrary(photos, library.chapters)
-      })
-      .finally(() => active && setRestoring(false))
+    let cancelled = false
+    void (async () => {
+      try {
+        const books = await listBooks()
+        if (cancelled) return
+        setBookList(books)
+        setShowWelcome(true)
+      } catch (error) {
+        console.warn('포토북 목록을 불러오지 못했습니다.', error)
+      } finally {
+        if (!cancelled) setRestoring(false)
+      }
+    })()
     return () => {
-      active = false
+      cancelled = true
     }
-  }, [setLibrary])
+  }, [])
+
+  async function openBook(bookId: string) {
+    setOpeningBookId(bookId)
+    setImportError('')
+    try {
+      revokePhotoUrls(useBookStore.getState().photos)
+      const workspace = await loadBookWorkspace(bookId)
+      const { library, bookLayout, pageNotes, drawings, cover, pageCaptions, curation, faceGroups, pageStickers, pageMaps, completedPages } = workspace
+      if (!library.photos.length) {
+        setImportError('이 포토북에 사진이 없습니다.')
+        return
+      }
+      const memos = Object.fromEntries(Object.entries(pageNotes).map(([pageId, notes]) => {
+        const kept = notes.filter((note) => note.kind === 'memo')
+        if (kept.length !== notes.length) void savePageNotes(pageId, kept)
+        return [pageId, kept]
+      }))
+      useBookStore.setState({
+        ...emptyEditorState(),
+        pageNotes: memos,
+        drawings,
+        pageCaptions,
+        pageStickers,
+        pageMaps,
+        curation,
+        faceGroups,
+        completedPages,
+        ...(cover ? { cover: { ...EMPTY_COVER, ...cover, stickers: cover.stickers ?? [] } } : {}),
+      })
+      if (bookLayout?.pages?.length) {
+        useBookStore.setState({
+          photos: library.photos,
+          chapters: library.chapters,
+          completedPages,
+        })
+        useBookStore.getState().restoreBookLayout(bookLayout)
+      } else {
+        setLibrary(library.photos, library.chapters)
+        useBookStore.setState({ completedPages })
+      }
+      setShowWelcome(false)
+      if ((curation.signalsVersion ?? 0) < SIGNALS_VERSION) {
+        void (async () => {
+          try {
+            const curated = await curatePhotos(useBookStore.getState().photos)
+            const nextCuration = { ...useBookStore.getState().curation, signalsVersion: SIGNALS_VERSION }
+            useBookStore.getState().patchPhotoSignals(curated)
+            useBookStore.setState({ curation: nextCuration })
+            await saveCurationSettings(nextCuration)
+          } catch (error) {
+            console.warn('사진 신호 재계산을 건너뜁니다.', error)
+          }
+        })()
+      }
+    } catch (error) {
+      console.warn('포토북을 열지 못했습니다.', error)
+      setImportError('포토북을 열지 못했습니다. 잠시 후 다시 시도해주세요.')
+    } finally {
+      setOpeningBookId(undefined)
+    }
+  }
+
+  async function goHome() {
+    const bookId = getActiveBookId()
+    const photos = useBookStore.getState().photos
+    if (bookId && photos.length) {
+      await syncBookMetaFromPhotos(bookId, photos)
+    }
+    await refreshBookList()
+    setShowWelcome(true)
+    setCoverMode(false)
+    setTraySelected([])
+    setTrayPreviewId(undefined)
+  }
+
+  async function removeBookFromList(bookId: string) {
+    setDeletingBookId(bookId)
+    try {
+      if (getActiveBookId() === bookId) {
+        revokePhotoUrls(useBookStore.getState().photos)
+        useBookStore.setState(emptyEditorState())
+        setActiveBookId(undefined)
+      }
+      await deleteBook(bookId)
+      await refreshBookList()
+    } catch (error) {
+      console.warn('포토북을 삭제하지 못했습니다.', error)
+      setImportError('포토북을 삭제하지 못했습니다.')
+    } finally {
+      setDeletingBookId(undefined)
+    }
+  }
+
+  async function startNewBook(files: File[]) {
+    if (!files.length) return
+    setImportError('')
+    let createdId: string | undefined
+    try {
+      const currentId = getActiveBookId()
+      const currentPhotos = useBookStore.getState().photos
+      if (currentId && currentPhotos.length) {
+        await syncBookMetaFromPhotos(currentId, currentPhotos)
+      }
+      revokePhotoUrls(currentPhotos)
+      useBookStore.setState(emptyEditorState())
+      const created = await createBook({ year: CURRENT_YEAR, title: '새 포토북' })
+      createdId = created.id
+      await importFiles(files, true)
+      const bookId = getActiveBookId()
+      if (bookId) await syncBookMetaFromPhotos(bookId, useBookStore.getState().photos)
+      await refreshBookList()
+    } catch (error) {
+      if (createdId && !useBookStore.getState().photos.length) {
+        try {
+          await deleteBook(createdId)
+          setActiveBookId(undefined)
+        } catch { /* ignore */ }
+        await refreshBookList()
+      }
+      setImportError(error instanceof Error ? error.message : '새 포토북을 만들지 못했습니다.')
+    }
+  }
 
   useEffect(() => {
     const keys = [...new Set(placeKey.split('|').filter(Boolean))]
@@ -157,9 +337,18 @@ function App() {
     if (!files.length) return
     setImportError('')
     try {
-      const scanned = await scanFiles(files, year, setProgress)
-      if (!scanned.length) throw new Error(`${year}년에 촬영한 사진을 찾지 못했습니다.`)
+      if (replace && !getActiveBookId()) {
+        await createBook({ year: CURRENT_YEAR, title: '새 포토북' })
+      }
+      if (!getActiveBookId()) throw new Error('활성 포토북이 없습니다.')
       const existing = replace ? [] : useBookStore.getState().photos
+      const preferredYear = replace ? undefined : (existing.length ? bookYearFromPhotos(existing) : undefined)
+      const scanned = await scanFiles(files, setProgress, { year: preferredYear })
+      if (!scanned.length) {
+        throw new Error(preferredYear
+          ? `${preferredYear}년에 촬영한 사진을 찾지 못했습니다.`
+          : '가져올 사진을 찾지 못했습니다.')
+      }
       const curated = await curatePhotos([...existing, ...scanned], (current, total) => {
         setProgress({ current, total, label: '사진을 고르는 중' })
       })
@@ -179,6 +368,7 @@ function App() {
       })
     } catch (error) {
       setImportError(error instanceof Error ? error.message : '사진을 가져오지 못했습니다.')
+      throw error instanceof Error ? error : new Error('사진을 가져오지 못했습니다.')
     } finally {
       setProgress(undefined)
     }
@@ -211,22 +401,226 @@ function App() {
     }
   }
 
-  async function exportPdf() {
-    const urls = new Map<string, string>()
+  function libraryPhotoIds() {
+    return trayEntries
+      .filter((entry): entry is { type: 'photo'; photo: Photo } => entry.type === 'photo')
+      .map((entry) => entry.photo.id)
+  }
+
+  function selectTrayPhotos(ids: string[], anchor?: string) {
+    setTraySelected(ids)
+    if (anchor !== undefined) trayAnchorRef.current = anchor
+    else if (ids.length === 1) trayAnchorRef.current = ids[0]
+  }
+
+  function paintTraySelection(ids: string[]) {
+    const list = trayListRef.current
+    if (!list) return
+    const selected = new Set(ids)
+    for (const node of list.querySelectorAll<HTMLElement>('.tray-photo-wrap')) {
+      const on = Boolean(node.dataset.photoId && selected.has(node.dataset.photoId))
+      node.classList.toggle('is-selected', on)
+      node.querySelector('.tray-photo')?.classList.toggle('is-selected', on)
+    }
+  }
+
+  function toggleTrayPhoto(photoId: string, event: React.MouseEvent) {
+    if (event.metaKey || event.ctrlKey) {
+      const next = new Set(traySelected)
+      if (next.has(photoId)) next.delete(photoId)
+      else next.add(photoId)
+      selectTrayPhotos([...next], photoId)
+      return
+    }
+    if (event.shiftKey && trayAnchorRef.current) {
+      const order = libraryPhotoIds()
+      const from = order.indexOf(trayAnchorRef.current)
+      const to = order.indexOf(photoId)
+      if (from >= 0 && to >= 0) {
+        const [lo, hi] = from < to ? [from, to] : [to, from]
+        selectTrayPhotos(order.slice(lo, hi + 1))
+        return
+      }
+    }
+    selectTrayPhotos([photoId], photoId)
+    const placement = pagePlacements.get(photoId)
+    if (placement) {
+      setCoverMode(false)
+      store.selectPage(placement.pageId)
+    }
+  }
+
+  function photosInMarquee(box: { left: number; top: number; width: number; height: number }) {
+    const list = trayListRef.current
+    if (!list) return [] as string[]
+    const listRect = list.getBoundingClientRect()
+    const sel = {
+      left: box.left,
+      top: box.top,
+      right: box.left + box.width,
+      bottom: box.top + box.height,
+    }
+    const hits: string[] = []
+    for (const node of list.querySelectorAll<HTMLElement>('.tray-photo-wrap')) {
+      const id = node.dataset.photoId
+      if (!id) continue
+      const rect = node.getBoundingClientRect()
+      const left = rect.left - listRect.left + list.scrollLeft
+      const top = rect.top - listRect.top + list.scrollTop
+      const right = left + rect.width
+      const bottom = top + rect.height
+      if (left < sel.right && right > sel.left && top < sel.bottom && bottom > sel.top) hits.push(id)
+    }
+    return hits
+  }
+
+  function hideTrayMarqueeBox() {
+    const box = marqueeBoxRef.current
+    if (!box) return
+    box.hidden = true
+    box.style.width = '0'
+    box.style.height = '0'
+  }
+
+  function beginTrayMarquee(event: React.PointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) return
+    const target = event.target as HTMLElement
+    if (target.closest('.tray-photo-wrap, .tray-delete, .tray-zoom, .tray-selection-bar')) return
+    const list = trayListRef.current
+    if (!list) return
+    event.preventDefault()
+    list.setPointerCapture(event.pointerId)
+    const rect = list.getBoundingClientRect()
+    const originX = event.clientX - rect.left + list.scrollLeft
+    const originY = event.clientY - rect.top + list.scrollTop
+    const additive = event.metaKey || event.ctrlKey
+    const baseline = new Set(additive ? traySelected : [])
+    marqueeRef.current = {
+      pointerId: event.pointerId,
+      originX,
+      originY,
+      additive,
+      baseline,
+      currentIds: additive ? [...baseline] : [],
+    }
+    marqueeKeyRef.current = ''
+    const box = marqueeBoxRef.current
+    if (box) {
+      box.hidden = false
+      box.style.left = `${originX}px`
+      box.style.top = `${originY}px`
+      box.style.width = '0'
+      box.style.height = '0'
+    }
+    if (!additive) {
+      selectTrayPhotos([])
+      paintTraySelection([])
+    }
+  }
+
+  function moveTrayMarquee(event: React.PointerEvent<HTMLDivElement>) {
+    const session = marqueeRef.current
+    if (!session || session.pointerId !== event.pointerId) return
+    const list = trayListRef.current
+    if (!list) return
+    const rect = list.getBoundingClientRect()
+    const x = event.clientX - rect.left + list.scrollLeft
+    const y = event.clientY - rect.top + list.scrollTop
+    const box = {
+      left: Math.min(session.originX, x),
+      top: Math.min(session.originY, y),
+      width: Math.abs(x - session.originX),
+      height: Math.abs(y - session.originY),
+    }
+    const boxEl = marqueeBoxRef.current
+    if (boxEl) {
+      boxEl.style.left = `${box.left}px`
+      boxEl.style.top = `${box.top}px`
+      boxEl.style.width = `${box.width}px`
+      boxEl.style.height = `${box.height}px`
+    }
+    if (marqueeRafRef.current) cancelAnimationFrame(marqueeRafRef.current)
+    marqueeRafRef.current = requestAnimationFrame(() => {
+      marqueeRafRef.current = 0
+      const active = marqueeRef.current
+      if (!active) return
+      const hits = photosInMarquee(box)
+      const next = active.additive ? [...new Set([...active.baseline, ...hits])] : hits
+      const key = next.join('\0')
+      if (key === marqueeKeyRef.current) return
+      marqueeKeyRef.current = key
+      active.currentIds = next
+      paintTraySelection(next)
+    })
+  }
+
+  function endTrayMarquee(event: React.PointerEvent<HTMLDivElement>) {
+    const session = marqueeRef.current
+    if (!session || session.pointerId !== event.pointerId) return
+    if (marqueeRafRef.current) {
+      cancelAnimationFrame(marqueeRafRef.current)
+      marqueeRafRef.current = 0
+    }
+    marqueeRef.current = null
+    hideTrayMarqueeBox()
+    selectTrayPhotos(session.currentIds)
     try {
-      const prepared = await preparePrintUrls(useBookStore.getState().photos, setExportLabel)
-      prepared.forEach((url, id) => urls.set(id, url))
+      trayListRef.current?.releasePointerCapture(event.pointerId)
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function removeFromLibrary(photoIds: string[]) {
+    const ids = [...new Set(photoIds)].filter((id) => store.photos.some((photo) => photo.id === id))
+    if (!ids.length) return
+    const anyPlaced = ids.some((id) => pagePlacements.has(id))
+    setDeleteConfirm({
+      ids,
+      title: ids.length > 1 ? `선택한 ${ids.length}장을 뺄까요?` : '이 사진을 뺄까요?',
+      body: anyPlaced
+        ? '책에 들어간 사진도 함께 빠집니다. 기기·폴더의 원본 파일은 삭제되지 않습니다.'
+        : '보관함에서만 빠지며, 기기·폴더의 원본 파일은 삭제되지 않습니다.',
+    })
+  }
+
+  function confirmRemoveFromLibrary() {
+    if (!deleteConfirm) return
+    const { ids } = deleteConfirm
+    store.removePhotos(ids)
+    setTraySelected((prev) => prev.filter((id) => !ids.includes(id)))
+    setTrayPreviewId((current) => (current && ids.includes(current) ? undefined : current))
+    setDeleteConfirm(null)
+  }
+
+  async function exportPdf() {
+    const owned: string[] = []
+    try {
+      const { pages } = useBookStore.getState()
+      if (!pages.length) {
+        window.alert('내보낼 페이지가 없습니다. 사진을 가져온 뒤 다시 시도해주세요.')
+        return
+      }
+      setExportLabel('원본 준비 중')
+      const withFiles = await attachPhotoBinaries(useBookStore.getState().photos)
+      const prepared = await preparePrintUrls(withFiles, setExportLabel)
+      owned.push(...prepared.owned)
       flushSync(() => {
-        setPrintUrls(Object.fromEntries(urls))
+        setPrintUrls(Object.fromEntries(prepared.urls))
         setExportLabel('PDF 만드는 중')
       })
       await waitForExportImages()
-      const { bookSize, orientation, pages } = useBookStore.getState()
+      await new Promise((resolve) => window.setTimeout(resolve, 120))
+      const { bookSize, orientation } = useBookStore.getState()
       await exportBookPdf(bookSize, orientation, pages.length, (page) => setExportLabel(`${page}/${pages.length}`))
     } catch (error) {
       console.warn('PDF 내보내기에 실패했습니다.', error)
+      const message = error instanceof Error
+        ? error.message
+        : '페이지 캡처에 실패했습니다. 사진이 모두 로드됐는지 확인한 뒤 다시 시도해주세요.'
+      window.alert(message)
     } finally {
-      revokePrintUrls(urls.values())
+      revokePrintUrls(owned)
       setPrintUrls({})
       setExportLabel('')
     }
@@ -238,11 +632,12 @@ function App() {
       const files = await chooseDirectoryFiles((count) => {
         setProgress({ current: count, total: 0, label: `폴더를 살펴보는 중 · ${count}개` })
       })
-      await importFiles(files)
+      await startNewBook(files)
     } catch (error) {
       setProgress(undefined)
       if (error instanceof Error && error.message === 'FALLBACK_INPUT') inputRef.current?.click()
       else if (error instanceof DOMException && error.name === 'AbortError') return
+      else if (error instanceof Error && error.message.includes('촬영한 사진')) setImportError(error.message)
       else setImportError('폴더를 열지 못했습니다. 아래 파일 선택을 사용해주세요.')
     }
   }
@@ -283,7 +678,7 @@ function App() {
     if (!cropPhotoId && !selectedCanvasPhotoId) return
     const onPointerDown = (event: PointerEvent) => {
       const target = event.target as HTMLElement
-      if (target.closest('.inline-crop-controls, .photo-actions, .swap-photo, .resize-handle, .chapter-toolbar')) return
+      if (target.closest('.inline-crop-controls, .photo-actions, .swap-photo, .resize-handle, .chapter-toolbar, .page-sticker, .page-map-widget, .sticker-picker, .cover-sticker')) return
       const cell = target.closest<HTMLElement>('.canvas-area .photo-cell')
       if (cell) {
         if (event.detail >= 2) return
@@ -326,32 +721,29 @@ function App() {
     return <main className="welcome loading-screen"><div className="brand"><BookOpen /><span>Year in Frames</span></div><p>지난 작업을 불러오는 중…</p></main>
   }
 
-  if (!store.photos.length || showWelcome) {
+  if (showWelcome || !store.photos.length) {
     return (
       <main className="welcome">
-        <nav className="brand"><BookOpen /><span>Year in Frames</span></nav>
+        <nav className="brand welcome-brand">
+          <span className="brand-mark"><BookOpen /><span>Year in Frames</span></span>
+          {user && (
+            <span className="auth-user-chip">
+              <small title={user.email ?? undefined}>{user.email}</small>
+              <button type="button" className="text-button" onClick={() => void signOutUser()}>로그아웃</button>
+            </span>
+          )}
+        </nav>
         <section className="welcome-content">
           <span className="eyebrow"><Sparkles size={14} /> 나만의 한 해</span>
           <h1>사진은 그대로.<br /><em>추억은 한 권으로.</em></h1>
-          <p className="lead">아이폰의 올해 사진을 불러오면 월별 기록과 여행을 찾아<br />아름다운 포토북 초안을 자동으로 만듭니다.</p>
+          <p className="lead">아이폰 사진 폴더를 선택하면 새 포토북이 만들어집니다.<br />이미 만든 책은 아래에서 이어서 편집할 수 있어요.</p>
           <div className="import-card">
-            <div className="year-row">
-              <label htmlFor="year">포토북 연도</label>
-              <select id="year" value={year} onChange={(event) => setYear(Number(event.target.value))}>
-                {YEAR_OPTIONS.map((option) => (
-                  <option key={option}>{option}</option>
-                ))}
-              </select>
-            </div>
-            <button className="import-button" onClick={pickFolder} disabled={Boolean(progress)}>
-              <FolderOpen /> 아이폰 사진 폴더 선택
+            <button className="import-button" onClick={() => void pickFolder()} disabled={Boolean(progress)}>
+              <FolderOpen /> 새 포토북 만들기
             </button>
-            {store.photos.length > 0 && (
-              <button className="secondary-button continue-button" onClick={() => setShowWelcome(false)}>
-                기존 포토북 편집 계속
-              </button>
-            )}
-            <button className="text-button" onClick={() => inputRef.current?.click()}>파일 또는 폴더 직접 선택</button>
+            <button className="text-button" onClick={() => inputRef.current?.click()} disabled={Boolean(progress)}>
+              파일 또는 폴더로 새 포토북 만들기
+            </button>
             <input
               ref={inputRef}
               className="hidden-input"
@@ -359,7 +751,11 @@ function App() {
               multiple
               accept="image/*,.heic,.heif,.mov,video/quicktime"
               {...({ webkitdirectory: '' } as React.InputHTMLAttributes<HTMLInputElement>)}
-              onChange={(event) => void importFiles(Array.from(event.target.files ?? []))}
+              onChange={(event) => {
+                const files = Array.from(event.target.files ?? [])
+                event.target.value = ''
+                void startNewBook(files)
+              }}
             />
             {progress && (
               <div className="progress">
@@ -369,6 +765,55 @@ function App() {
             )}
             {importError && <p className="error">{importError}</p>}
           </div>
+          {bookList.length > 0 && (
+            <section className="book-shelf" aria-label="포토북 목록">
+              <header className="book-shelf-heading">
+                <h2>내 포토북</h2>
+                <span>{bookList.length}권</span>
+              </header>
+              <ul className="book-shelf-list">
+                {bookList.map((book) => {
+                  const busy = openingBookId === book.id || deletingBookId === book.id
+                  return (
+                    <li key={book.id} className="book-card">
+                      <button
+                        type="button"
+                        className="book-card-main"
+                        disabled={busy || Boolean(progress)}
+                        onClick={() => void openBook(book.id)}
+                      >
+                        <span className="book-card-cover">
+                          {book.coverThumbUrl
+                            ? <img src={book.coverThumbUrl} alt="" />
+                            : <BookOpen />}
+                        </span>
+                        <span className="book-card-meta">
+                          <strong>{book.title || book.periodLabel}</strong>
+                          <small>{book.photoCount}장</small>
+                          <small>{new Date(book.updatedAt).toLocaleDateString('ko-KR')}</small>
+                          {openingBookId === book.id && <em>여는 중…</em>}
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        className="book-card-delete"
+                        aria-label={`${book.title} 삭제`}
+                        title="포토북 삭제"
+                        disabled={busy || Boolean(progress)}
+                        onClick={() => {
+                          if (window.confirm(`「${book.title || book.periodLabel}」포토북을 삭제할까요?\n사진 원본 파일은 기기에 그대로 남습니다.`)) {
+                            void removeBookFromList(book.id)
+                          }
+                        }}
+                      >
+                        <Trash2 />
+                      </button>
+                    </li>
+                  )
+                })}
+              </ul>
+            </section>
+          )}
           <aside className="iphone-tip">
             <strong>아이폰 연결 전 확인</strong>
             설정 → 사진 → Mac 또는 PC로 전송에서 <b>원본 유지</b>를 선택하면 실시간 사진도 가져올 수 있어요.
@@ -388,7 +833,29 @@ function App() {
         if (event.dataTransfer.files.length) void importFiles(Array.from(event.dataTransfer.files), false)
       }}
       onKeyDown={(event) => {
-        if (event.key === 'Delete' && document.activeElement?.tagName !== 'INPUT' && document.activeElement?.tagName !== 'TEXTAREA') {
+        if (event.key === 'Escape') {
+          if (deleteConfirm) {
+            setDeleteConfirm(null)
+            return
+          }
+          if (trayPreviewId) {
+            setTrayPreviewId(undefined)
+            return
+          }
+          if (traySelected.length) {
+            selectTrayPhotos([])
+            return
+          }
+        }
+        if ((event.key === 'Delete' || event.key === 'Backspace')
+          && document.activeElement?.tagName !== 'INPUT'
+          && document.activeElement?.tagName !== 'TEXTAREA'
+          && !trayPreviewId) {
+          if (traySelected.length) {
+            event.preventDefault()
+            removeFromLibrary(traySelected)
+            return
+          }
           const focused = document.querySelector<HTMLElement>('.photo-cell:focus')
           if (focused?.dataset.photoId) store.unplacePhoto(focused.dataset.photoId)
         }
@@ -396,11 +863,13 @@ function App() {
       }}
     >
       <header className="topbar">
-        <div className="brand"><BookOpen /><span>Year in Frames</span><i>{year}</i></div>
+        <div className="brand"><BookOpen /><span>Year in Frames</span><i title={bookPeriod}>{bookPeriod || bookYear}</i></div>
         <button className="top-add-photo" onClick={() => addInputRef.current?.click()}><ImagePlus /> 사진 추가</button>
         <input ref={addInputRef} className="hidden-input" type="file" multiple accept="image/*,.heic,.heif" onChange={(e) => void importFiles(Array.from(e.target.files ?? []), false)} />
         <div className="top-actions">
-          <button className="ghost-button" onClick={() => setShowWelcome(true)}><Home /> 첫 화면</button>
+          {user?.email && <span className="auth-user-label" title={user.email}>{user.email}</span>}
+          <button className="ghost-button" onClick={() => void signOutUser()} title="로그아웃"><LogOut /> 로그아웃</button>
+          <button className="ghost-button" onClick={() => void goHome()}><Home /> 첫 화면</button>
           <button className="ghost-button" onClick={store.undo}><RotateCcw /> 되돌리기</button>
           <button className="smart-layout-button" onClick={() => void createSmartLayout()} disabled={Boolean(analysisProgress)}>
             <WandSparkles /> {analysisProgress ? `사진 분석 ${analysisProgress}%` : '스마트 배치'}
@@ -432,13 +901,15 @@ function App() {
         {store.pages.length >= MAX_PAGES && <div className="page-warning">50페이지 한도입니다. 사진 크기를 작게 바꿔 페이지를 줄여보세요.</div>}
         <div className="page-list" ref={pageListRef}>
           <button className={`page-thumb cover-thumb ${coverMode ? 'active' : ''}`} onClick={() => setCoverMode(true)}>
-            <span>표지</span>
-            <MiniJacket />
+            <span className="page-thumb-label">표지</span>
+            <MiniJacket year={bookYear} />
           </button>
           {store.pages.map((page, index) => {
             const chapter = store.chapters.find((item) => item.id === page.chapterId)
-            const heading = store.pages[index - 1]?.chapterId === page.chapterId ? undefined : chapterHeading(chapter)
-            const caption = pageCaption(chapter, store.pageNotes[page.id] ?? [])
+            const heading = store.pages[index - 1]?.chapterId === page.chapterId ? undefined : chapterHeading(chapter, store.photos)
+            const caption = pageCaption(chapter, store.pageNotes[page.id] ?? [], store.photos)
+            const completed = Boolean(store.completedPages[page.id])
+            const canInsert = store.pages.length < MAX_PAGES && page.chapterId !== YEAR_CHAPTER_ID
             return (
               <div key={page.id} className="page-list-block">
                 {heading && chapter && (
@@ -452,25 +923,58 @@ function App() {
                     />
                   </label>
                 )}
-                <div className="page-thumb-wrap">
+                <div className={`page-thumb-wrap${completed ? ' is-complete' : ''}`}>
                 <button
-                  className={`page-thumb ${!coverMode && page.id === selectedPage?.id ? 'active' : ''}`}
+                  className={`page-thumb ${!coverMode && page.id === selectedPage?.id ? 'active' : ''}${completed ? ' is-complete' : ''}`}
                   onClick={() => { setCoverMode(false); store.selectPage(page.id) }}
-                  onDragOver={(event) => event.preventDefault()}
+                  onDragOver={(event) => {
+                    if (completed) return
+                    event.preventDefault()
+                  }}
                   onDrop={(event) => {
-                    const photoId = event.dataTransfer.getData('photo/id')
-                    if (photoId) store.movePhoto(photoId, page.id)
+                    if (completed) return
+                    for (const photoId of readDroppedPhotoIds(event)) {
+                      if (page.type === 'photos') store.addPhotoToPage(photoId, page.id)
+                      else store.movePhoto(photoId, page.id)
+                    }
                   }}
                 >
-                  <span>{index + 1}</span>
+                  <span className="page-thumb-label">{index + 1}</span>
                   <MiniPage page={page} chapter={chapter} notes={store.pageNotes[page.id] ?? []} />
                   {caption && <em className="page-thumb-caption">{caption}</em>}
                 </button>
-                <button type="button" className="page-delete" aria-label="페이지 삭제" title="이 페이지를 책에서 빼기" onClick={() => store.removePage(page.id)}><Trash2 /></button>
+                {!completed && (
+                  <button type="button" className="page-delete" aria-label="페이지 삭제" title="이 페이지를 책에서 빼기" onClick={() => store.removePage(page.id)}><Trash2 /></button>
+                )}
                 </div>
+                {canInsert && (
+                  <button
+                    type="button"
+                    className="page-insert"
+                    title="아래에 빈 페이지 추가"
+                    aria-label="아래에 빈 페이지 추가"
+                    onClick={() => {
+                      setCoverMode(false)
+                      store.addBlankPage(page.id)
+                    }}
+                  >
+                    <Plus />
+                  </button>
+                )}
               </div>
             )
           })}
+          <button
+            type="button"
+            className="page-add-button"
+            disabled={store.pages.length >= MAX_PAGES || !store.chapters.some((chapter) => chapter.id !== YEAR_CHAPTER_ID)}
+            onClick={() => {
+              setCoverMode(false)
+              store.addBlankPage(selectedPage?.chapterId === YEAR_CHAPTER_ID ? undefined : selectedPage?.id)
+            }}
+          >
+            <Plus /> 페이지 추가
+          </button>
         </div>
         </>
         )}
@@ -481,11 +985,14 @@ function App() {
           <>
             <div className="chapter-toolbar">
               {coverMode ? (
-                <CoverBar />
+                <CoverBar
+                  stickerPanel={stickerPicker && stickerPicker !== 'page' ? stickerPicker : null}
+                  onStickerPanel={(panel) => setStickerPicker(panel)}
+                />
               ) : (
                 <>
                   <div>
-                    <span>{selectedChapter?.type === 'trip' ? '여행 챕터' : `${selectedChapter?.month}월 챕터`}</span>
+                    <span>{selectedChapter ? chapterHeading(selectedChapter, store.photos).label : '챕터'}</span>
                     <input
                       value={selectedChapter?.title ?? ''}
                       aria-label="챕터 제목"
@@ -493,11 +1000,30 @@ function App() {
                       onChange={(event) => selectedChapter && store.updateChapter(selectedChapter.id, { title: event.target.value })}
                     />
                   </div>
-                  <div className="note-toolbar">
-                    <button type="button" onClick={() => store.addPageNote(selectedPage.id)}>메모</button>
-                    <button type="button" className={drawMode ? 'active' : ''} onClick={() => setDrawMode((on) => !on)}><Pencil /> 그리기</button>
-                  </div>
-                  {drawMode && (
+                  {!pageCompleted && (
+                    <div className="note-toolbar">
+                      <button type="button" onClick={() => store.addPageNote(selectedPage.id)}>메모</button>
+                      <button type="button" className={drawMode ? 'active' : ''} onClick={() => { setDrawMode((on) => !on); setStickerPicker(null) }}><Pencil /> 그리기</button>
+                      <button
+                        type="button"
+                        className={stickerPicker === 'page' ? 'active' : ''}
+                        onClick={() => { setStickerPicker((open) => (open === 'page' ? null : 'page')); setDrawMode(false) }}
+                      >
+                        스티커
+                      </button>
+                      <button
+                        type="button"
+                        className={store.pageMaps[selectedPage.id] ? 'active' : ''}
+                        onClick={() => {
+                          if (store.pageMaps[selectedPage.id]) store.removePageMap(selectedPage.id)
+                          else store.addPageMap(selectedPage.id)
+                        }}
+                      >
+                        지도
+                      </button>
+                    </div>
+                  )}
+                  {!pageCompleted && drawMode && (
                     <div className="draw-tools">
                       <label className="note-swatch">색<input type="color" aria-label="펜 색" value={penColor} onChange={(event) => setPenColor(event.target.value)} /></label>
                       <label className="note-opacity">굵기<input type="range" min={0.4} max={2.4} step={0.1} aria-label="펜 굵기" value={penSize} onChange={(event) => setPenSize(Number(event.target.value))} /></label>
@@ -505,26 +1031,53 @@ function App() {
                       <button type="button" onClick={() => store.clearStrokes(selectedPage.id)}>모두 지우기</button>
                     </div>
                   )}
+                  {!pageCompleted && stickerPicker === 'page' && selectedPage && (
+                    <StickerPicker
+                      onPick={(emoji) => {
+                        store.addPageSticker(selectedPage.id, emoji)
+                        setStickerPicker(null)
+                      }}
+                      onClose={() => setStickerPicker(null)}
+                    />
+                  )}
                   <span>페이지 {selectedIndex + 1}</span>
-                  <button type="button" onClick={() => selectedPage && store.removePage(selectedPage.id)}>페이지 삭제</button>
+                  <button
+                    type="button"
+                    className={`page-complete-button${pageCompleted ? ' is-complete' : ''}`}
+                    onClick={() => {
+                      if (!selectedPage) return
+                      if (!pageCompleted) {
+                        setDrawMode(false)
+                        setStickerPicker(null)
+                        setCropPhotoId(undefined)
+                        setSelectedCanvasPhotoId(undefined)
+                      }
+                      store.setPageCompleted(selectedPage.id, !pageCompleted)
+                    }}
+                  >
+                    {pageCompleted ? <><Lock size={14} /> 완료 취소</> : <><Check size={14} /> 완료</>}
+                  </button>
+                  {!pageCompleted && (
+                    <button type="button" onClick={() => selectedPage && store.removePage(selectedPage.id)}>페이지 삭제</button>
+                  )}
                 </>
               )}
             </div>
             <div className="canvas-area" ref={canvasRef}>
               {!coverMode && <button className="page-arrow" disabled={selectedIndex === 0} onClick={() => store.selectPage(store.pages[selectedIndex - 1].id)}><ChevronLeft /></button>}
-              {coverMode ? <BookJacket year={year} editable /> : (
+              {coverMode ? <BookJacket year={bookYear} editable /> : (
                 <PagePaper
                   page={selectedPage}
                   chapter={selectedChapter}
-                  editable
-                  drawing={drawMode}
+                  editable={!pageCompleted}
+                  drawing={!pageCompleted && drawMode}
                   penColor={penColor}
                   penSize={penSize}
-                  onOpenLive={setLivePhoto}
-                  croppingPhotoId={cropPhotoId}
-                  selectedPhotoId={selectedCanvasPhotoId}
-                  onSelectPhoto={setSelectedCanvasPhotoId}
-                  onCrop={openCrop}
+                  onOpenLive={pageCompleted ? undefined : ((photo) => { void attachPhotoBinary(photo).then(setLivePhoto) })}
+                  croppingPhotoId={pageCompleted ? undefined : cropPhotoId}
+                  selectedPhotoId={pageCompleted ? undefined : selectedCanvasPhotoId}
+                  onSelectPhoto={pageCompleted ? undefined : setSelectedCanvasPhotoId}
+                  onCrop={pageCompleted ? undefined : openCrop}
                   onCloseCrop={() => setCropPhotoId(undefined)}
                   pageNumber={selectedIndex + 1}
                   placeRevision={placeRevision}
@@ -535,9 +1088,11 @@ function App() {
             <div className="drag-hint">
               {coverMode
                 ? <><Upload size={15} /> 앞표지 · 책등 · 뒤표지를 수정합니다. 사진은 끌어다 놓거나 위 목록에서 고릅니다.</>
-                : drawMode
-                  ? <><Pencil size={15} /> 페이지 위를 드래그해 그립니다. 그리기를 다시 누르면 끝납니다.</>
-                  : <><Upload size={15} /> 사진을 고른 뒤 다른 사진의 바꾸기를 누르면 두 장만 자리가 바뀝니다</>}
+                : pageCompleted
+                  ? <><Lock size={15} /> 이 페이지는 완료되어 수정할 수 없습니다. 완료 취소를 누르면 다시 편집할 수 있습니다.</>
+                  : drawMode
+                    ? <><Pencil size={15} /> 페이지 위를 드래그해 그립니다. 그리기를 다시 누르면 끝납니다.</>
+                    : <><Upload size={15} /> 사진을 고른 뒤 다른 사진의 바꾸기를 누르면 두 장만 자리가 바뀝니다</>}
             </div>
           </>
         )}
@@ -609,11 +1164,25 @@ function App() {
           <div className="aspect-mode">
             <span>나머지 사진</span>
             <div>
-              <button className={(selectedPage?.flowAspect ?? 'locked') === 'locked' ? 'active' : ''} onClick={() => selectedPage && store.setPageFlowAspect(selectedPage.id, 'locked')}>비율 유지</button>
-              <button className={selectedPage?.flowAspect === 'free' ? 'active' : ''} onClick={() => selectedPage && store.setPageFlowAspect(selectedPage.id, 'free')}>자유 채우기</button>
+              <button
+                className={(selectedPage?.flowAspect ?? 'locked') === 'locked' ? 'active' : ''}
+                disabled={pageCompleted}
+                onClick={() => selectedPage && store.setPageFlowAspect(selectedPage.id, 'locked')}
+              >
+                비율 유지
+              </button>
+              <button
+                className={selectedPage?.flowAspect === 'free' ? 'active' : ''}
+                disabled={pageCompleted}
+                onClick={() => selectedPage && store.setPageFlowAspect(selectedPage.id, 'free')}
+              >
+                자유 채우기
+              </button>
             </div>
           </div>
-          {selectedPage?.type === 'photos' ? (
+          {pageCompleted ? (
+            <p className="tray-empty">완료된 페이지는 배치를 바꿀 수 없습니다.</p>
+          ) : selectedPage?.type === 'photos' ? (
             <div className="template-options">
               {availableLayouts(selectedPage.photoIds.length).map((layout) => {
                 const pagePhotos = selectedPage.photoIds.map((id) => store.photos.find((photo) => photo.id === id)).filter((photo): photo is Photo => Boolean(photo))
@@ -637,7 +1206,7 @@ function App() {
             </div>
           ) : <p className="tray-empty">사진 페이지에서 추천 배치를 선택할 수 있어요.</p>}
         </section>
-        <section className="photo-library">
+        <section className={`photo-library${trayDragging ? ' is-dragging' : ''}${traySelected.length ? ' has-selection' : ''}`}>
           <div className="tray-heading">
             <span>사진 보관함</span>
             <div className="thumb-size">
@@ -668,46 +1237,131 @@ function App() {
             </div>
             <b>{store.photos.length}</b>
           </div>
-          <div className="photo-tray-list" ref={trayListRef}>
-            {libraryEntries(store.photos, year).map((entry) => {
+          {traySelected.length > 0 && (
+            <div className="tray-selection-bar">
+              <span>{traySelected.length}장 선택</span>
+              <button type="button" onClick={() => selectTrayPhotos([])}>선택 해제</button>
+              <button type="button" className="tray-selection-delete" onClick={() => removeFromLibrary(traySelected)}>
+                <Trash2 /> 삭제
+              </button>
+            </div>
+          )}
+          <div
+            className="photo-tray-list"
+            ref={trayListRef}
+            onPointerDown={beginTrayMarquee}
+            onPointerMove={moveTrayMarquee}
+            onPointerUp={endTrayMarquee}
+            onPointerCancel={endTrayMarquee}
+          >
+            <div ref={marqueeBoxRef} className="tray-marquee" hidden />
+            {trayEntries.map((entry) => {
               if (entry.type === 'month') return <div key={entry.key} className="tray-month">{entry.label}</div>
               if (entry.type === 'day') return <div key={entry.key} className="tray-day">{entry.label}</div>
               const photo = entry.photo
               const placement = pagePlacements.get(photo.id)
-              const onCanvas = selectedPage?.photoIds.includes(photo.id)
+              const onCanvas = onCanvasIds.has(photo.id)
+              const selected = traySelectedSet.has(photo.id)
               return (
-                <button
-                  key={photo.id}
-                  className={`tray-photo${placement ? ' placed' : ''}${onCanvas ? ' on-canvas' : ''}`}
-                  data-photo-id={photo.id}
-                  draggable
-                  onDragStart={(event) => event.dataTransfer.setData('photo/id', photo.id)}
-                  onClick={() => placement && store.selectPage(placement.pageId)}
-                  onDoubleClick={() => openCrop(photo)}
-                  title={[
-                    photo.name,
-                    photoHoldLabel(photo.excludeReason, photo.holdReason),
-                    placement ? `${placement.number}페이지로 이동` : '페이지로 드래그',
-                  ].filter(Boolean).join(' · ')}
-                >
-                  <img src={photo.thumbUrl} alt={photo.name} style={photoStyle(photo)} />
-                  {placement && <b className="page-mark">{placement.number}</b>}
-                  {(photo.excludeReason || photo.holdReason) && <em className="exclude-mark">{photoHoldLabel(photo.excludeReason, photo.holdReason)}</em>}
-                  {photo.excludeReason && (
-                    <span
-                      className="include-mark"
-                      onClick={(event) => {
-                        event.stopPropagation()
-                        store.includePhotos([photo.id])
-                      }}
-                    >
-                      넣기
-                    </span>
-                  )}
-                  <span>{sceneLabel(photo.analysis?.scene ?? 'other')}</span>
-                </button>
+                <div key={photo.id} className={`tray-photo-wrap${selected ? ' is-selected' : ''}`} data-photo-id={photo.id}>
+                  <button
+                    className={`tray-photo${placement ? ' placed' : ''}${onCanvas ? ' on-canvas' : ''}${selected ? ' is-selected' : ''}`}
+                    data-photo-id={photo.id}
+                    draggable
+                    onDragStart={(event) => {
+                      const ids = selected ? traySelected : [photo.id]
+                      if (!selected) selectTrayPhotos([photo.id], photo.id)
+                      event.dataTransfer.setData('photo/id', ids[0])
+                      event.dataTransfer.setData('photo/ids', JSON.stringify(ids))
+                      event.dataTransfer.effectAllowed = 'move'
+                      setTrayDragging(true)
+                    }}
+                    onDragEnd={() => {
+                      setTrayDragging(false)
+                      setTrashHot(false)
+                    }}
+                    onClick={(event) => toggleTrayPhoto(photo.id, event)}
+                    onDoubleClick={() => openCrop(photo)}
+                    title={[
+                      photo.name,
+                      photoHoldLabel(photo.excludeReason, photo.holdReason),
+                      'Ctrl/⌘ 클릭·드래그로 다중 선택',
+                      placement ? `${placement.number}페이지로 이동` : '페이지로 드래그',
+                    ].filter(Boolean).join(' · ')}
+                  >
+                    <img src={photo.thumbUrl} alt={photo.name} loading="lazy" decoding="async" style={photoStyle(photo)} />
+                    {placement && <b className="page-mark">{placement.number}</b>}
+                    {(photo.excludeReason || photo.holdReason) && <em className="exclude-mark">{photoHoldLabel(photo.excludeReason, photo.holdReason)}</em>}
+                    {photo.excludeReason && (
+                      <span
+                        className="include-mark"
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          store.includePhotos([photo.id])
+                        }}
+                      >
+                        넣기
+                      </span>
+                    )}
+                    <span>{sceneLabel(photo.analysis?.scene ?? 'other')}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="tray-zoom"
+                    aria-label="사진 크게 보기"
+                    title="크게 보기"
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      selectTrayPhotos([photo.id], photo.id)
+                      setTrayPreviewId(photo.id)
+                    }}
+                  >
+                    <Maximize2 />
+                  </button>
+                  <button
+                    type="button"
+                    className="tray-delete"
+                    aria-label="보관함에서 삭제"
+                    title="보관함에서 빼기 (기기 원본은 그대로)"
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      removeFromLibrary(selected && traySelectedSet.has(photo.id) ? traySelected : [photo.id])
+                    }}
+                  >
+                    <Trash2 />
+                  </button>
+                </div>
               )
             })}
+          </div>
+          <div
+            className={`tray-trash${trayDragging ? ' is-visible' : ''}${trashHot ? ' is-hot' : ''}`}
+            onDragEnter={(event) => {
+              if (!trayDragging) return
+              event.preventDefault()
+              setTrashHot(true)
+            }}
+            onDragOver={(event) => {
+              if (!trayDragging) return
+              event.preventDefault()
+              event.dataTransfer.dropEffect = 'move'
+              setTrashHot(true)
+            }}
+            onDragLeave={(event) => {
+              if (event.currentTarget.contains(event.relatedTarget as Node)) return
+              setTrashHot(false)
+            }}
+            onDrop={(event) => {
+              event.preventDefault()
+              const ids = readDroppedPhotoIds(event)
+              setTrayDragging(false)
+              setTrashHot(false)
+              if (ids.length) removeFromLibrary(ids)
+            }}
+          >
+            <Trash2 />
+            <span>여기에 놓으면 보관함에서 삭제</span>
+            <small>기기·폴더의 원본 파일은 삭제되지 않습니다</small>
           </div>
         </section>
       </aside>
@@ -752,10 +1406,21 @@ function App() {
             />
             얼굴 그룹{faceProgress > 0 ? ` ${faceProgress}%` : ''}
           </label>
+          {store.curation.faceGroupsEnabled && (
+            <p className="face-hint">
+              {(store.curation.focusFaceIds?.length ?? 0) > 0
+                ? `선택한 ${store.curation.focusFaceIds!.length}명이 나온 사진만 책에 넣습니다.`
+                : '사람을 고르면 그 사람들이 나온 사진만 포토북에 넣습니다.'}
+              {(store.curation.focusFaceIds?.length ?? 0) > 0 && (
+                <button type="button" className="text-button" onClick={() => store.clearFocusFaces()}>전체 보기</button>
+              )}
+            </p>
+          )}
           {store.curation.faceGroupsEnabled && store.faceGroups.map((group) => {
             const cover = store.photos.find((photo) => photo.id === (group.coverPhotoId ?? group.photoIds[0]))
+            const focused = (store.curation.focusFaceIds ?? []).includes(group.id)
             return (
-              <div key={group.id} className="face-row">
+              <div key={group.id} className={`face-row${focused ? ' is-focused' : ''}${group.hidden ? ' is-hidden' : ''}`}>
                 {cover && <img src={cover.thumbUrl} alt="" />}
                 <input
                   aria-label="사람 이름"
@@ -763,6 +1428,15 @@ function App() {
                   placeholder="이름"
                   onChange={(event) => store.renameFaceGroup(group.id, event.target.value)}
                 />
+                <button
+                  type="button"
+                  className={focused ? 'active' : ''}
+                  disabled={group.hidden}
+                  title="이 사람이 나온 사진만 책에 포함"
+                  onClick={() => store.toggleFocusFace(group.id)}
+                >
+                  책
+                </button>
                 <button type="button" onClick={() => store.setFaceGroupHidden(group.id, !group.hidden)}>{group.hidden ? '표시' : '숨기기'}</button>
               </div>
             )
@@ -771,8 +1445,42 @@ function App() {
       )}
 
       {livePhoto && <LivePhotoPicker photo={livePhoto} onClose={() => setLivePhoto(undefined)} onSelect={(data) => store.setSelectedFrame(livePhoto.id, data)} />}
+      {deleteConfirm && (
+        <div className="confirm-backdrop" role="dialog" aria-modal="true" aria-labelledby="delete-confirm-title" onClick={() => setDeleteConfirm(null)}>
+          <div className="confirm-card" onClick={(event) => event.stopPropagation()}>
+            <h2 id="delete-confirm-title">{deleteConfirm.title}</h2>
+            <p>{deleteConfirm.body}</p>
+            <div className="confirm-actions">
+              <button type="button" className="ghost-button" onClick={() => setDeleteConfirm(null)}>취소</button>
+              <button type="button" className="danger-button" onClick={confirmRemoveFromLibrary}>삭제</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {trayPreviewId && (
+        <TrayPhotoPreview
+          photoId={trayPreviewId}
+          photoIds={libraryPhotoIds()}
+          photos={store.photos}
+          placement={pagePlacements.get(trayPreviewId)}
+          onClose={() => setTrayPreviewId(undefined)}
+          onNavigate={(id) => {
+            setTrayPreviewId(id)
+            selectTrayPhotos([id], id)
+          }}
+          onGoToPage={(pageId) => {
+            setTrayPreviewId(undefined)
+            setCoverMode(false)
+            store.selectPage(pageId)
+          }}
+          onCrop={(photo) => {
+            setTrayPreviewId(undefined)
+            openCrop(photo)
+          }}
+        />
+      )}
       <div className="export-stage" aria-hidden>
-        <BookJacket year={year} printUrls={printUrls} printing />
+        <BookJacket year={bookYear} printUrls={printUrls} printing />
         {store.pages.map((page, index) => (
           <PagePaper key={page.id} page={page} chapter={store.chapters.find((chapter) => chapter.id === page.chapterId)} exportIndex={index} printUrls={printUrls} pageNumber={index + 1} placeRevision={placeRevision} />
         ))}
@@ -781,8 +1489,124 @@ function App() {
   )
 }
 
+function TrayPhotoPreview({
+  photoId,
+  photoIds,
+  photos,
+  placement,
+  onClose,
+  onNavigate,
+  onGoToPage,
+  onCrop,
+}: {
+  photoId: string
+  photoIds: string[]
+  photos: Photo[]
+  placement?: { pageId: string; number: number }
+  onClose: () => void
+  onNavigate: (id: string) => void
+  onGoToPage: (pageId: string) => void
+  onCrop: (photo: Photo) => void
+}) {
+  const index = Math.max(0, photoIds.indexOf(photoId))
+  const photo = photos.find((item) => item.id === photoId)
+  const thumbSrc = photo?.thumbUrl
+  const fullSrc = photo?.selectedFrame || (photo && photo.url !== photo.thumbUrl ? photo.url : undefined) || thumbSrc
+  const [src, setSrc] = useState(thumbSrc || fullSrc)
+  const captured = photo?.capturedAt
+    ? new Date(photo.capturedAt).toLocaleString('ko-KR', { dateStyle: 'medium', timeStyle: 'short' })
+    : ''
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'ArrowLeft' && index > 0) onNavigate(photoIds[index - 1])
+      if (event.key === 'ArrowRight' && index < photoIds.length - 1) onNavigate(photoIds[index + 1])
+      if (event.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [index, photoIds, onClose, onNavigate])
+
+  useEffect(() => {
+    if (!thumbSrc && !fullSrc) return
+    setSrc(thumbSrc || fullSrc)
+    if (!fullSrc || fullSrc === thumbSrc) return
+    let cancelled = false
+    const img = new Image()
+    img.decoding = 'async'
+    img.onload = () => {
+      if (!cancelled) setSrc(fullSrc)
+    }
+    img.src = fullSrc
+    return () => {
+      cancelled = true
+      img.onload = null
+    }
+  }, [photoId, thumbSrc, fullSrc])
+
+  if (!photo || !src) return null
+
+  const rotation = ((photo.rotation ?? 0) % 360 + 360) % 360
+  const previewStyle: React.CSSProperties = {
+    objectFit: 'contain',
+    transform: rotation ? `rotate(${rotation}deg)` : undefined,
+  }
+
+  return (
+    <div className="tray-preview-backdrop" role="dialog" aria-modal="true" aria-label="사진 미리보기" onClick={onClose}>
+      <div className="tray-preview" onClick={(event) => event.stopPropagation()}>
+        <header>
+          <div>
+            <h2>{photo.name}</h2>
+            {captured && <p>{captured}</p>}
+          </div>
+          <button type="button" className="icon-button" aria-label="닫기" onClick={onClose}><X /></button>
+        </header>
+        <div className="tray-preview-stage">
+          <button
+            type="button"
+            className="tray-preview-nav"
+            aria-label="이전 사진"
+            disabled={index <= 0}
+            onClick={() => onNavigate(photoIds[index - 1])}
+          >
+            <ChevronLeft />
+          </button>
+          <img src={src} alt={photo.name} style={previewStyle} />
+          <button
+            type="button"
+            className="tray-preview-nav"
+            aria-label="다음 사진"
+            disabled={index >= photoIds.length - 1}
+            onClick={() => onNavigate(photoIds[index + 1])}
+          >
+            <ChevronRight />
+          </button>
+        </div>
+        <footer>
+          <span>{index + 1} / {photoIds.length}</span>
+          <div className="tray-preview-actions">
+            {placement && (
+              <button type="button" className="ghost-button" onClick={() => onGoToPage(placement.pageId)}>
+                {placement.number}페이지로 이동
+              </button>
+            )}
+            <button type="button" className="ghost-button" onClick={() => onCrop(photo)}><Crop /> 자르기</button>
+            <button type="button" className="primary-button" onClick={onClose}>닫기</button>
+          </div>
+        </footer>
+      </div>
+    </div>
+  )
+}
+
 function MiniPage({ page, chapter, notes = [] }: { page: BookPage; chapter?: Chapter; notes?: PageNote[] }) {
-  const { photos, bookSize, orientation } = useBookStore()
+  const { photos, bookSize, orientation, pageStickers } = useBookStore(useShallow((state) => ({
+    photos: state.photos,
+    bookSize: state.bookSize,
+    orientation: state.orientation,
+    pageStickers: state.pageStickers,
+  })))
   const items = page.photoIds.map((id) => photos.find((photo) => photo.id === id)).filter(Boolean) as Photo[]
   const ratio = orientation === 'portrait' ? bookSize.widthMm / bookSize.heightMm : bookSize.heightMm / bookSize.widthMm
   const preserveFlowAspect = (page.flowAspect ?? 'locked') === 'locked'
@@ -790,9 +1614,94 @@ function MiniPage({ page, chapter, notes = [] }: { page: BookPage; chapter?: Cha
   const activeAnchorId = [...items]
     .filter((photo) => photo.freeFrame)
     .sort((a, b) => (b.framePriority ?? 0) - (a.framePriority ?? 0))[0]?.id
-  const monthLabel = chapter?.type === 'trip' ? '여행' : chapter?.month ? `${chapter.month}월` : ''
+  const chapterYearNum = chapterYearLabel(chapter, photos) ?? (Number(items[0]?.capturedAt.slice(0, 4)) || CURRENT_YEAR)
+  const monthLabel = chapter?.type === 'trip'
+    ? '여행'
+    : chapter?.month
+      ? `${chapterYearNum}년 ${chapter.month}월`
+      : ''
+  const chapterYear = String(chapterYearNum)
+  const memos = notes.filter((note) => note.kind === 'memo')
+  const stickers = pageStickers[page.id] ?? []
+
+  if (page.type === 'year-months') {
+    return (
+      <div className="mini-paper type-year-months" style={{ '--page-ratio': ratio } as React.CSSProperties}>
+        <strong className="mini-year-label">MONTHS</strong>
+        <div className="mini-year-grid">
+          {items.slice(0, 12).map((photo) => (
+            <span key={photo.id}>
+              <img src={photo.thumbUrl || photo.url} alt="" style={photoStyle(photo)} />
+            </span>
+          ))}
+        </div>
+      </div>
+    )
+  }
+  if (page.type === 'year-map') {
+    return (
+      <div className="mini-paper type-year-map" style={{ '--page-ratio': ratio } as React.CSSProperties}>
+        <MapPinned />
+        <strong className="mini-year-label">MAP</strong>
+        <div className="mini-year-grid is-map">
+          {items.slice(0, 9).map((photo) => (
+            <span key={photo.id}>
+              <img src={photo.thumbUrl || photo.url} alt="" style={photoStyle(photo)} />
+            </span>
+          ))}
+        </div>
+      </div>
+    )
+  }
+  if (page.type === 'intro') {
+    const cover = items[0]
+    return (
+      <div className="mini-paper type-intro" style={{ '--page-ratio': ratio } as React.CSSProperties}>
+        {cover && <img className="mini-cover-image" src={cover.thumbUrl || cover.url} alt="" style={photoStyle(cover)} />}
+        <div className="mini-cover-shade" />
+        <div className="mini-copy">
+          <span>{chapter?.type === 'trip' ? 'JOURNEY' : `${chapter?.month?.toString().padStart(2, '0') ?? ''} / ${chapterYear}`}</span>
+          <b>{chapter?.title}</b>
+          {chapter?.note && <em>{chapter.note}</em>}
+        </div>
+        {stickers.map((sticker) => (
+          <span
+            key={sticker.id}
+            className="mini-sticker"
+            style={{
+              left: `${sticker.x * 100}%`,
+              top: `${sticker.y * 100}%`,
+              width: `${sticker.size * 100}%`,
+              transform: `translate(-50%, -50%) rotate(${sticker.rotation ?? 0}deg)`,
+            }}
+            aria-hidden
+          >
+            {sticker.emoji}
+          </span>
+        ))}
+        {memos.map((note) => (
+          <span
+            key={note.id}
+            className={`mini-note kind-memo color-${note.color}`}
+            style={{
+              left: `${note.x * 100}%`,
+              top: `${note.y * 100}%`,
+              width: `${(note.width ?? 0.3) * 100}%`,
+              height: `${(note.height ?? 0.24) * 100}%`,
+              color: noteLook(note).text,
+              backgroundColor: noteLook(note).css,
+            }}
+          >
+            {note.text}
+          </span>
+        ))}
+      </div>
+    )
+  }
+
   return (
-    <div className={`mini-paper type-${page.type} layout-${page.layoutId ?? ''}`} style={{ '--page-ratio': ratio } as React.CSSProperties}>
+    <div className={`mini-paper type-${page.type} layout-${page.layoutId ?? ''}${items.length ? '' : ' is-empty'}`} style={{ '--page-ratio': ratio } as React.CSSProperties}>
+      {!items.length && <span className="mini-empty">빈 페이지</span>}
       {items.slice(0, 8).map((photo, index) => (
         <span
           className={`mini-cell ${activeAnchorId === photo.id ? 'free-anchor' : ''} ${photo.layoutLocked ? 'is-locked' : ''}`}
@@ -803,15 +1712,8 @@ function MiniPage({ page, chapter, notes = [] }: { page: BookPage; chapter?: Cha
         </span>
       ))}
       {page.type === 'map' && <MapPinned />}
-      {page.type === 'intro' && (
-        <div className="mini-copy">
-          <span>{chapter?.type === 'trip' ? 'JOURNEY' : monthLabel}</span>
-          <b>{chapter?.title}</b>
-          {chapter?.note && <em>{chapter.note}</em>}
-        </div>
-      )}
-      {page.type !== 'intro' && monthLabel && <span className="mini-month">{monthLabel}</span>}
-      {notes.filter((note) => note.kind === 'memo').map((note) => (
+      {monthLabel && <span className="mini-month">{monthLabel}</span>}
+      {memos.map((note) => (
         <span
           key={note.id}
           className={`mini-note kind-memo color-${note.color}`}
@@ -831,17 +1733,42 @@ function MiniPage({ page, chapter, notes = [] }: { page: BookPage; chapter?: Cha
   )
 }
 
-function pageCaption(chapter: Chapter | undefined, notes: PageNote[]) {
-  const month = chapter?.type === 'trip' ? (chapter.title || '여행') : chapter?.month ? `${chapter.month}월` : ''
+function chapterYearLabel(chapter: Chapter | undefined, photos: Photo[]) {
+  if (!chapter?.photoIds?.length) return undefined
+  for (const id of chapter.photoIds) {
+    const photo = photos.find((item) => item.id === id)
+    if (!photo) continue
+    const year = new Date(photo.capturedAt).getFullYear()
+    if (!Number.isNaN(year)) return year
+  }
+  return undefined
+}
+
+function pageCaption(chapter: Chapter | undefined, notes: PageNote[], photos: Photo[] = []) {
+  const year = chapterYearLabel(chapter, photos)
+  const month = chapter?.type === 'trip'
+    ? (chapter.title || '여행')
+    : chapter?.month
+      ? (year ? `${year}년 ${chapter.month}월` : `${chapter.month}월`)
+      : ''
   const title = chapter?.type === 'month' && chapter.title && chapter.title !== `${chapter.month}월` ? chapter.title : ''
   const phrases = notes.map((note) => note.text.trim()).filter(Boolean)
   return [month, title, chapter?.note, ...phrases].filter(Boolean).join(' · ')
 }
 
-function chapterHeading(chapter?: Chapter) {
+function chapterHeading(chapter?: Chapter, photos: Photo[] = []) {
   if (!chapter) return { label: '챕터', title: '' }
-  const label = chapter.type === 'trip' ? '여행 챕터' : `${chapter.month}월 챕터`
-  const sameAsLabel = chapter.title === label || chapter.title === `${chapter.month}월`
+  if (chapter.id === YEAR_CHAPTER_ID) {
+    const year = chapterYearLabel(chapter, photos) ?? bookYearFromPhotos(photos)
+    return { label: `${year}년 기록`, title: chapter.title === '한 해의 기록' ? '' : chapter.title }
+  }
+  const year = chapterYearLabel(chapter, photos)
+  const label = chapter.type === 'trip'
+    ? '여행 챕터'
+    : year
+      ? `${year}년 ${chapter.month}월 챕터`
+      : `${chapter.month}월 챕터`
+  const sameAsLabel = chapter.title === label || chapter.title === `${chapter.month}월` || (year != null && chapter.title === `${year}년 ${chapter.month}월`)
   return { label, title: sameAsLabel ? '' : chapter.title }
 }
 
@@ -857,7 +1784,48 @@ function pagePlacementByPhoto(pages: BookPage[]) {
   return placements
 }
 
-function libraryEntries(photos: Photo[], year: number) {
+function readDroppedPhotoIds(event: React.DragEvent) {
+  const many = event.dataTransfer.getData('photo/ids')
+  if (many) {
+    try {
+      const parsed = JSON.parse(many) as unknown
+      if (Array.isArray(parsed)) return parsed.filter((id): id is string => typeof id === 'string' && Boolean(id))
+    } catch {
+      /* ignore */
+    }
+  }
+  const one = event.dataTransfer.getData('photo/id')
+  return one ? [one] : []
+}
+
+function bookYearFromPhotos(photos: Photo[]) {
+  const counts = new Map<number, number>()
+  for (const photo of photos) {
+    const year = new Date(photo.capturedAt).getFullYear()
+    if (Number.isNaN(year)) continue
+    counts.set(year, (counts.get(year) ?? 0) + 1)
+  }
+  if (!counts.size) return CURRENT_YEAR
+  return [...counts.entries()].sort((a, b) => b[1] - a[1] || b[0] - a[0])[0][0]
+}
+
+function existingBookPeriod(photos: Photo[]) {
+  const stamps = photos
+    .map((photo) => new Date(photo.capturedAt))
+    .filter((date) => !Number.isNaN(date.getTime()))
+    .sort((a, b) => a.getTime() - b.getTime())
+  if (!stamps.length) return '저장된 작업'
+  const start = stamps[0]
+  const end = stamps[stamps.length - 1]
+  const format = (date: Date) => `${date.getFullYear()}년 ${date.getMonth() + 1}월`
+  if (start.getFullYear() === end.getFullYear() && start.getMonth() === end.getMonth()) return format(start)
+  if (start.getFullYear() === end.getFullYear()) {
+    return `${start.getFullYear()}년 ${start.getMonth() + 1}월 – ${end.getMonth() + 1}월`
+  }
+  return `${format(start)} – ${format(end)}`
+}
+
+function libraryEntries(photos: Photo[]) {
   const sorted = [...photos].sort((a, b) => a.capturedAt.localeCompare(b.capturedAt))
   const entries: Array<
     | { type: 'month'; key: string; label: string }
@@ -877,11 +1845,10 @@ function libraryEntries(photos: Photo[], year: number) {
     if (nextMonth !== monthKey) {
       monthKey = nextMonth
       dayKey = ''
-      const month = `${date.getMonth() + 1}월`
       entries.push({
         type: 'month',
         key: nextMonth,
-        label: date.getFullYear() === year ? month : `${date.getFullYear()}년 ${month}`,
+        label: `${date.getFullYear()}년 ${date.getMonth() + 1}월`,
       })
     }
     if (nextDay !== dayKey) {
@@ -916,7 +1883,37 @@ function PagePaper({ page, chapter, editable = false, drawing = false, penColor 
   pageNumber?: number
   placeRevision?: number
 }) {
-  const { photos, updateChapter, updatePhotoFrame, updatePhotoFrames, setLayoutLock, setPhotoCrop, rotatePhoto, addPhotoToPage, unplacePhoto, swapPhotoPositions, bookSize, orientation, marginMm, pageNotes, updatePageNote, removePageNote, pageCaptions, updatePageCaption } = useBookStore()
+  const {
+    photos, updateChapter, updatePhotoFrame, updatePhotoFrames, setLayoutLock, setPhotoCrop, rotatePhoto,
+    addPhotoToPage, unplacePhoto, swapPhotoPositions, bookSize, orientation, marginMm,
+    pageNotes, updatePageNote, removePageNote, pageCaptions, updatePageCaption,
+    pageStickers, updatePageSticker, removePageSticker, pageMaps, updatePageMap, removePageMap,
+  } = useBookStore(useShallow((state) => ({
+    photos: state.photos,
+    updateChapter: state.updateChapter,
+    updatePhotoFrame: state.updatePhotoFrame,
+    updatePhotoFrames: state.updatePhotoFrames,
+    setLayoutLock: state.setLayoutLock,
+    setPhotoCrop: state.setPhotoCrop,
+    rotatePhoto: state.rotatePhoto,
+    addPhotoToPage: state.addPhotoToPage,
+    unplacePhoto: state.unplacePhoto,
+    swapPhotoPositions: state.swapPhotoPositions,
+    bookSize: state.bookSize,
+    orientation: state.orientation,
+    marginMm: state.marginMm,
+    pageNotes: state.pageNotes,
+    updatePageNote: state.updatePageNote,
+    removePageNote: state.removePageNote,
+    pageCaptions: state.pageCaptions,
+    updatePageCaption: state.updatePageCaption,
+    pageStickers: state.pageStickers,
+    updatePageSticker: state.updatePageSticker,
+    removePageSticker: state.removePageSticker,
+    pageMaps: state.pageMaps,
+    updatePageMap: state.updatePageMap,
+    removePageMap: state.removePageMap,
+  })))
   const gridRef = useRef<HTMLDivElement>(null)
   const [measuredRects, setMeasuredRects] = useState<Record<string, PhotoFrame>>({})
   const measureKey = page.type === 'photos' ? `${page.layoutId ?? ''}|${page.photoIds.join(',')}` : ''
@@ -954,6 +1951,59 @@ function PagePaper({ page, chapter, editable = false, drawing = false, penColor 
       .filter((gutter) => gutter.before.some((id) => !lockedIds.has(id)) || gutter.after.some((id) => !lockedIds.has(id)))
     : []
 
+  const cropOpen = Boolean(editable && croppingPhotoId)
+
+  if (page.type === 'year-months') {
+    const yearLabel = items[0] ? new Date(items[0].capturedAt).getFullYear() : chapterYear
+    return (
+      <article className="book-page year-months-page" style={style} data-export-page={exportIndex}>
+        <header className="year-page-head">
+          <span>THE YEAR IN FRAMES</span>
+          <h2>{yearLabel}년의 달들</h2>
+          <p>매달을 대표하는 사진으로 한 해를 펼칩니다.</p>
+        </header>
+        <div className={`year-months-grid count-${Math.min(items.length, 12)}`}>
+          {items.map((photo) => {
+            const month = new Date(photo.capturedAt).getMonth() + 1
+            return (
+              <figure key={photo.id} className="year-month-card">
+                <img src={imageSrc(photo, exportIndex, printUrls)} alt="" style={photoStyle(photo)} />
+                <figcaption>
+                  <b>{String(month).padStart(2, '0')}</b>
+                  <span>{month}월</span>
+                </figcaption>
+              </figure>
+            )
+          })}
+        </div>
+        <PageNotes pageId={page.id} notes={pageNotes[page.id] ?? []} editable={editable} updatePageNote={updatePageNote} removePageNote={removePageNote} />
+        <PageStickersLayer pageId={page.id} stickers={pageStickers[page.id] ?? []} editable={editable} update={updatePageSticker} remove={removePageSticker} />
+        <PageDrawing pageId={page.id} active={Boolean(editable && drawing)} color={penColor} size={penSize} ratio={ratio} />
+        <PageFooter pageId={page.id} photos={items} chapter={chapter} pageNumber={pageNumber} placeRevision={placeRevision} editable={editable} caption={pageCaptions[page.id]} updatePageCaption={updatePageCaption} />
+      </article>
+    )
+  }
+  if (page.type === 'year-map') {
+    const yearLabel = items[0] ? new Date(items[0].capturedAt).getFullYear() : chapterYear
+    return (
+      <article className="book-page map-page year-map-page" style={style} data-export-page={exportIndex}>
+        <div className="map-title">
+          <span>PLACES OF {yearLabel}</span>
+          <ChapterTitle chapter={chapter} editable={editable} updateChapter={updateChapter} />
+        </div>
+        <TripMap
+          photos={items.length ? items : chapterPhotos}
+          showPhotos
+          showRoute={false}
+          forExport={exportIndex !== undefined}
+        />
+        <PageNotes pageId={page.id} notes={pageNotes[page.id] ?? []} editable={editable} updatePageNote={updatePageNote} removePageNote={removePageNote} />
+        <PageStickersLayer pageId={page.id} stickers={pageStickers[page.id] ?? []} editable={editable} update={updatePageSticker} remove={removePageSticker} />
+        <PageDrawing pageId={page.id} active={Boolean(editable && drawing)} color={penColor} size={penSize} ratio={ratio} />
+        <PageFooter pageId={page.id} photos={items} chapter={chapter} pageNumber={pageNumber} placeRevision={placeRevision} editable={editable} caption={pageCaptions[page.id]} updatePageCaption={updatePageCaption} />
+      </article>
+    )
+  }
   if (page.type === 'intro') {
     const cover = items[0]
     return (
@@ -972,6 +2022,8 @@ function PagePaper({ page, chapter, editable = false, drawing = false, penColor 
           ) : chapter?.note && <p>{chapter.note}</p>}
         </div>
         <PageNotes pageId={page.id} notes={pageNotes[page.id] ?? []} editable={editable} updatePageNote={updatePageNote} removePageNote={removePageNote} />
+        <PageStickersLayer pageId={page.id} stickers={pageStickers[page.id] ?? []} editable={editable} update={updatePageSticker} remove={removePageSticker} />
+        <PageMapLayer pageId={page.id} widget={pageMaps[page.id]} photos={chapterPhotos.length ? chapterPhotos : items} editable={editable} forExport={exportIndex !== undefined} update={updatePageMap} remove={removePageMap} />
         <PageDrawing pageId={page.id} active={Boolean(editable && drawing)} color={penColor} size={penSize} ratio={ratio} />
         <PageFooter pageId={page.id} photos={chapterPhotos.length ? chapterPhotos : items} chapter={chapter} pageNumber={pageNumber} placeRevision={placeRevision} editable={editable} caption={pageCaptions[page.id]} updatePageCaption={updatePageCaption} />
       </article>
@@ -981,8 +2033,9 @@ function PagePaper({ page, chapter, editable = false, drawing = false, penColor 
     return (
       <article className="book-page map-page" style={style} data-export-page={exportIndex}>
         <div className="map-title"><span>OUR ROUTE</span><ChapterTitle chapter={chapter} editable={editable} updateChapter={updateChapter} /></div>
-        <TripMap photos={chapterPhotos} />
+        <TripMap photos={chapterPhotos} forExport={exportIndex !== undefined} />
         <PageNotes pageId={page.id} notes={pageNotes[page.id] ?? []} editable={editable} updatePageNote={updatePageNote} removePageNote={removePageNote} />
+        <PageStickersLayer pageId={page.id} stickers={pageStickers[page.id] ?? []} editable={editable} update={updatePageSticker} remove={removePageSticker} />
         <PageDrawing pageId={page.id} active={Boolean(editable && drawing)} color={penColor} size={penSize} ratio={ratio} />
         <PageFooter pageId={page.id} photos={chapterPhotos} chapter={chapter} pageNumber={pageNumber} placeRevision={placeRevision} editable={editable} caption={pageCaptions[page.id]} updatePageCaption={updatePageCaption} />
       </article>
@@ -990,18 +2043,23 @@ function PagePaper({ page, chapter, editable = false, drawing = false, penColor 
   }
   return (
     <article
-      className="book-page photo-page"
+      className={`book-page photo-page${cropOpen ? ' has-inline-crop' : ''}`}
       style={style}
       data-export-page={exportIndex}
       onDragOver={(event) => editable && event.preventDefault()}
       onDrop={(event) => {
         if (!editable) return
-        const id = event.dataTransfer.getData('photo/id')
-        if (id) addPhotoToPage(id, page.id)
+        for (const id of readDroppedPhotoIds(event)) addPhotoToPage(id, page.id)
       }}
     >
       <ChapterTitle chapter={chapter} editable={editable} updateChapter={updateChapter} />
-      <div className={`photo-grid layout-${page.layoutId ?? 'many-tiles'}`} ref={gridRef}>
+      <div className={`photo-grid layout-${page.layoutId ?? 'many-tiles'}${items.length ? '' : ' is-empty'}`} ref={gridRef}>
+        {!items.length && editable && (
+          <div className="empty-page-hint">
+            <ImagePlus />
+            <span>사진을 여기로 끌어다 놓으세요</span>
+          </div>
+        )}
         {items.map((photo, index) => (
           <div
             key={photo.id}
@@ -1012,14 +2070,17 @@ function PagePaper({ page, chapter, editable = false, drawing = false, penColor 
             draggable={false}
             onDoubleClick={(event) => {
               if (!editable || drawing) return
-              if ((event.target as HTMLElement).closest('button')) return
+              if ((event.target as HTMLElement).closest('button, input, textarea')) return
               event.preventDefault()
+              window.getSelection()?.removeAllRanges()
               onCrop?.(photo)
             }}
             onPointerDown={(event) => {
               if (!editable || drawing) return
-              if ((event.target as HTMLElement).closest('button')) return
+              if ((event.target as HTMLElement).closest('button, input, textarea')) return
               if (event.detail > 1) {
+                event.preventDefault()
+                window.getSelection()?.removeAllRanges()
                 onCrop?.(photo)
                 return
               }
@@ -1038,26 +2099,32 @@ function PagePaper({ page, chapter, editable = false, drawing = false, penColor 
               event.preventDefault()
               event.stopPropagation()
               event.currentTarget.classList.remove('drop-target')
-              const sourceId = event.dataTransfer.getData('photo/id')
-              if (sourceId) addPhotoToPage(sourceId, page.id)
+              for (const sourceId of readDroppedPhotoIds(event)) addPhotoToPage(sourceId, page.id)
             }}
           >
-            <img
-              src={imageSrc(photo, exportIndex, printUrls)}
-              alt={photo.name}
-              draggable={false}
-              style={photoStyle(photo, adaptiveRects[index], ratio, preserveFlowAspect)}
-            />
+            <div className="photo-media">
+              <img
+                src={imageSrc(photo, exportIndex, printUrls)}
+                alt={photo.name}
+                draggable={false}
+                style={photoStyle(photo, adaptiveRects[index], ratio, preserveFlowAspect)}
+              />
+            </div>
             {editable && photo.analysis && (
               <span className={`scene-badge scene-${photo.analysis.scene}`}>
                 {photo.analysis.scene === 'people' ? <Users /> : photo.analysis.scene === 'landscape' ? <Mountain /> : <LayoutTemplate />}
-                {sceneLabel(photo.analysis.scene)}
+                <span className="action-label">{sceneLabel(photo.analysis.scene)}</span>
               </span>
             )}
             {editable && (
               <div className="photo-actions">
-                {photo.isLive && <button onClick={() => onOpenLive?.(photo)} title="실시간 사진 장면 선택">LIVE</button>}
+                {photo.isLive && (
+                  <button type="button" onClick={() => onOpenLive?.(photo)} title="실시간 사진 장면 선택" aria-label="실시간 사진 장면 선택">
+                    <span className="action-label">LIVE</span>
+                  </button>
+                )}
                 <button
+                  type="button"
                   className={`lock-action${photo.layoutLocked ? ' active' : ''}`}
                   title={photo.layoutLocked ? '크기와 위치 고정 해제' : '크기와 위치 고정'}
                   aria-label={photo.layoutLocked ? '크기와 위치 고정 해제' : '크기와 위치 고정'}
@@ -1074,7 +2141,7 @@ function PagePaper({ page, chapter, editable = false, drawing = false, penColor 
                 >
                   <Lock />
                 </button>
-                <button onClick={() => onCrop?.(photo)} title="사진 자르기"><Crop /></button>
+                <button type="button" onClick={() => onCrop?.(photo)} title="사진 자르기" aria-label="사진 자르기"><Crop /></button>
                 <button
                   type="button"
                   title="시계 방향으로 90도 회전"
@@ -1083,8 +2150,12 @@ function PagePaper({ page, chapter, editable = false, drawing = false, penColor 
                 >
                   <RotateCw />
                 </button>
-                {chapter?.type === 'month' && <button onClick={() => updateChapter(chapter.id, { coverPhotoId: photo.id })} title="이달의 대표 사진">대표</button>}
-                <button className="delete-action" onClick={() => unplacePhoto(photo.id)} title="페이지에서 빼기"><Trash2 /></button>
+                {chapter?.type === 'month' && (
+                  <button type="button" onClick={() => updateChapter(chapter.id, { coverPhotoId: photo.id })} title="이달의 대표 사진" aria-label="이달의 대표 사진">
+                    <span className="action-label">대표</span>
+                  </button>
+                )}
+                <button type="button" className="delete-action" onClick={() => unplacePhoto(photo.id)} title="페이지에서 빼기" aria-label="페이지에서 빼기"><Trash2 /></button>
               </div>
             )}
             {editable && selectedPhotoId && selectedPhotoId !== photo.id && (
@@ -1150,10 +2221,303 @@ function PagePaper({ page, chapter, editable = false, drawing = false, penColor 
         ))}
       </div>
       <PageNotes pageId={page.id} notes={pageNotes[page.id] ?? []} editable={editable} updatePageNote={updatePageNote} removePageNote={removePageNote} />
+      <PageStickersLayer pageId={page.id} stickers={pageStickers[page.id] ?? []} editable={editable} update={updatePageSticker} remove={removePageSticker} />
+      <PageMapLayer pageId={page.id} widget={pageMaps[page.id]} photos={items} editable={editable} forExport={exportIndex !== undefined} update={updatePageMap} remove={removePageMap} />
       <PageDrawing pageId={page.id} active={Boolean(editable && drawing)} color={penColor} size={penSize} ratio={ratio} />
       <PageFooter pageId={page.id} photos={items} chapter={chapter} pageNumber={pageNumber} placeRevision={placeRevision} editable={editable} caption={pageCaptions[page.id]} updatePageCaption={updatePageCaption} />
     </article>
   )
+}
+
+function StickerPicker({ onPick, onClose }: { onPick: (emoji: string) => void; onClose: () => void }) {
+  return (
+    <div className="sticker-picker" role="listbox" aria-label="스티커 고르기">
+      <div className="sticker-picker-head">
+        <strong>스티커</strong>
+        <button type="button" onClick={onClose} aria-label="닫기">×</button>
+      </div>
+      <div className="sticker-grid">
+        {STICKER_EMOJIS.map((emoji) => (
+          <button key={emoji} type="button" onClick={() => onPick(emoji)} aria-label={`스티커 ${emoji}`}>{emoji}</button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function PageStickersLayer({ pageId, stickers, editable, update, remove }: {
+  pageId: string
+  stickers: PageSticker[]
+  editable: boolean
+  update: (pageId: string, stickerId: string, patch: Partial<PageSticker>) => void
+  remove: (pageId: string, stickerId: string) => void
+}) {
+  return stickers.map((sticker) => (
+    <div
+      key={sticker.id}
+      className={`page-sticker${editable ? ' is-editing' : ''}`}
+      style={{
+        left: `${sticker.x * 100}%`,
+        top: `${sticker.y * 100}%`,
+        width: `${sticker.size * 100}%`,
+        transform: `rotate(${sticker.rotation ?? 0}deg)`,
+      }}
+      onPointerDown={(event) => {
+        if (!editable) return
+        if ((event.target as HTMLElement).closest('button')) return
+        beginStickerDrag(event, pageId, sticker, update)
+      }}
+    >
+      <span aria-hidden>{sticker.emoji}</span>
+      {editable && (
+        <>
+          <button type="button" className="sticker-rotate" title="돌리기" onClick={() => update(pageId, sticker.id, { rotation: (((sticker.rotation ?? 0) + 15) % 360) })}>↻</button>
+          <button type="button" className="sticker-grow" title="크게" onClick={() => update(pageId, sticker.id, { size: Math.min(0.4, sticker.size + 0.03) })}>+</button>
+          <button type="button" className="sticker-shrink" title="작게" onClick={() => update(pageId, sticker.id, { size: Math.max(0.06, sticker.size - 0.03) })}>−</button>
+          <button type="button" className="note-delete" onClick={() => remove(pageId, sticker.id)} aria-label="스티커 삭제">×</button>
+        </>
+      )}
+    </div>
+  ))
+}
+
+function beginStickerDrag(
+  event: React.PointerEvent<HTMLDivElement>,
+  pageId: string,
+  sticker: PageSticker,
+  update: (pageId: string, stickerId: string, patch: Partial<PageSticker>) => void,
+) {
+  event.preventDefault()
+  event.stopPropagation()
+  const el = event.currentTarget
+  const page = el.closest<HTMLElement>('.book-page')
+  if (!page) return
+  const rect = page.getBoundingClientRect()
+  const startX = event.clientX
+  const startY = event.clientY
+  const originX = sticker.x
+  const originY = sticker.y
+  el.setPointerCapture(event.pointerId)
+  const move = (moveEvent: PointerEvent) => {
+    update(pageId, sticker.id, {
+      x: Math.min(0.92, Math.max(0.02, originX + (moveEvent.clientX - startX) / rect.width)),
+      y: Math.min(0.92, Math.max(0.02, originY + (moveEvent.clientY - startY) / rect.height)),
+    })
+  }
+  const end = () => {
+    el.removeEventListener('pointermove', move)
+    el.removeEventListener('pointerup', end)
+  }
+  el.addEventListener('pointermove', move)
+  el.addEventListener('pointerup', end)
+}
+
+function CoverStickersLayer({ panel, stickers, editable, update, remove }: {
+  panel: CoverPanel
+  stickers: CoverSticker[]
+  editable: boolean
+  update: (stickerId: string, patch: Partial<CoverSticker>) => void
+  remove: (stickerId: string) => void
+}) {
+  return stickers.filter((item) => item.panel === panel).map((sticker) => (
+    <div
+      key={sticker.id}
+      className={`cover-sticker${editable ? ' is-editing' : ''}`}
+      style={{
+        left: `${sticker.x * 100}%`,
+        top: `${sticker.y * 100}%`,
+        width: `${sticker.size * 100}%`,
+        transform: `rotate(${sticker.rotation ?? 0}deg)`,
+      }}
+      onPointerDown={(event) => {
+        if (!editable) return
+        if ((event.target as HTMLElement).closest('button')) return
+        beginCoverStickerDrag(event, sticker, update)
+      }}
+    >
+      <span aria-hidden>{sticker.emoji}</span>
+      {editable && (
+        <>
+          <button type="button" className="sticker-grow" title="크게" onClick={() => update(sticker.id, { size: Math.min(0.45, sticker.size + 0.03) })}>+</button>
+          <button type="button" className="note-delete" onClick={() => remove(sticker.id)} aria-label="스티커 삭제">×</button>
+        </>
+      )}
+    </div>
+  ))
+}
+
+function beginCoverStickerDrag(
+  event: React.PointerEvent<HTMLDivElement>,
+  sticker: CoverSticker,
+  update: (stickerId: string, patch: Partial<CoverSticker>) => void,
+) {
+  event.preventDefault()
+  event.stopPropagation()
+  const el = event.currentTarget
+  const panel = el.closest<HTMLElement>('.jacket-panel')
+  if (!panel) return
+  const rect = panel.getBoundingClientRect()
+  const startX = event.clientX
+  const startY = event.clientY
+  const originX = sticker.x
+  const originY = sticker.y
+  el.setPointerCapture(event.pointerId)
+  const move = (moveEvent: PointerEvent) => {
+    update(sticker.id, {
+      x: Math.min(0.9, Math.max(0.02, originX + (moveEvent.clientX - startX) / rect.width)),
+      y: Math.min(0.9, Math.max(0.02, originY + (moveEvent.clientY - startY) / rect.height)),
+    })
+  }
+  const end = () => {
+    el.removeEventListener('pointermove', move)
+    el.removeEventListener('pointerup', end)
+  }
+  el.addEventListener('pointermove', move)
+  el.addEventListener('pointerup', end)
+}
+
+function PageMapLayer({ pageId, widget, photos, editable, forExport = false, update, remove }: {
+  pageId: string
+  widget?: PageMapWidget
+  photos: Photo[]
+  editable: boolean
+  forExport?: boolean
+  update: (pageId: string, patch: Partial<PageMapWidget>) => void
+  remove: (pageId: string) => void
+}) {
+  if (!widget) return null
+  return (
+    <div
+      className={`page-map-widget${editable ? ' is-editing' : ''}`}
+      style={{
+        left: `${widget.x * 100}%`,
+        top: `${widget.y * 100}%`,
+        width: `${widget.width * 100}%`,
+        height: `${widget.height * 100}%`,
+      }}
+    >
+      {editable && (
+        <div className="page-map-tools">
+          <button
+            type="button"
+            className="map-move-handle"
+            aria-label="지도 위젯 이동"
+            title="여기 잡고 드래그하면 지도 칸을 옮깁니다"
+            onPointerDown={(event) => beginMapDrag(event, pageId, widget, update)}
+          >
+            옮기기
+          </button>
+          <span>지도 안에서는 드래그·줌으로 위치를 맞춥니다</span>
+          <button type="button" onClick={() => remove(pageId)} aria-label="지도 빼기">×</button>
+        </div>
+      )}
+      <div className="page-map-body">
+        <TripMap
+          photos={photos}
+          interactive={!forExport}
+          forExport={forExport}
+          sizeToken={`${widget.width.toFixed(2)}x${widget.height.toFixed(2)}`}
+        />
+      </div>
+      {editable && (
+        <>
+          <button
+            type="button"
+            className="map-resize map-resize-se"
+            aria-label="지도 크기 조절"
+            onPointerDown={(event) => beginMapResize(event, pageId, widget, update, 'se')}
+          />
+          <button
+            type="button"
+            className="map-resize map-resize-e"
+            aria-label="지도 가로 크기 조절"
+            onPointerDown={(event) => beginMapResize(event, pageId, widget, update, 'e')}
+          />
+          <button
+            type="button"
+            className="map-resize map-resize-s"
+            aria-label="지도 세로 크기 조절"
+            onPointerDown={(event) => beginMapResize(event, pageId, widget, update, 's')}
+          />
+        </>
+      )}
+    </div>
+  )
+}
+
+function beginMapDrag(
+  event: React.PointerEvent<HTMLElement>,
+  pageId: string,
+  widget: PageMapWidget,
+  update: (pageId: string, patch: Partial<PageMapWidget>) => void,
+) {
+  event.preventDefault()
+  event.stopPropagation()
+  const handle = event.currentTarget
+  const widgetEl = handle.closest<HTMLElement>('.page-map-widget')
+  const page = handle.closest<HTMLElement>('.book-page')
+  if (!page) return
+  const rect = page.getBoundingClientRect()
+  const startX = event.clientX
+  const startY = event.clientY
+  const originX = widget.x
+  const originY = widget.y
+  const width = widget.width
+  const height = widget.height
+  widgetEl?.classList.add('is-dragging')
+  handle.setPointerCapture(event.pointerId)
+  const move = (moveEvent: PointerEvent) => {
+    update(pageId, {
+      x: Math.min(1 - width, Math.max(0, originX + (moveEvent.clientX - startX) / rect.width)),
+      y: Math.min(1 - height, Math.max(0, originY + (moveEvent.clientY - startY) / rect.height)),
+    })
+  }
+  const end = () => {
+    widgetEl?.classList.remove('is-dragging')
+    handle.removeEventListener('pointermove', move)
+    handle.removeEventListener('pointerup', end)
+    handle.removeEventListener('pointercancel', end)
+  }
+  handle.addEventListener('pointermove', move)
+  handle.addEventListener('pointerup', end)
+  handle.addEventListener('pointercancel', end)
+}
+
+function beginMapResize(
+  event: React.PointerEvent<HTMLButtonElement>,
+  pageId: string,
+  widget: PageMapWidget,
+  update: (pageId: string, patch: Partial<PageMapWidget>) => void,
+  edge: 'se' | 'e' | 's' = 'se',
+) {
+  event.preventDefault()
+  event.stopPropagation()
+  const handle = event.currentTarget
+  const page = handle.closest<HTMLElement>('.book-page')
+  if (!page) return
+  const rect = page.getBoundingClientRect()
+  const originW = widget.width
+  const originH = widget.height
+  const originX = widget.x
+  const originY = widget.y
+  const startX = event.clientX
+  const startY = event.clientY
+  handle.setPointerCapture(event.pointerId)
+  const move = (moveEvent: PointerEvent) => {
+    const dx = (moveEvent.clientX - startX) / rect.width
+    const dy = (moveEvent.clientY - startY) / rect.height
+    const nextWidth = edge === 's' ? originW : Math.min(1 - originX, Math.max(0.16, originW + dx))
+    const nextHeight = edge === 'e' ? originH : Math.min(1 - originY, Math.max(0.14, originH + dy))
+    update(pageId, { width: nextWidth, height: nextHeight })
+  }
+  const end = () => {
+    handle.removeEventListener('pointermove', move)
+    handle.removeEventListener('pointerup', end)
+    handle.removeEventListener('pointercancel', end)
+  }
+  handle.addEventListener('pointermove', move)
+  handle.addEventListener('pointerup', end)
+  handle.addEventListener('pointercancel', end)
 }
 
 function ChapterTitle({ chapter, editable, updateChapter }: {
@@ -1398,24 +2762,111 @@ function beginNoteResize(
   handle.addEventListener('pointercancel', end)
 }
 
-function MiniJacket() {
+function MiniJacket({ year }: { year: number }) {
   const cover = useBookStore((state) => state.cover)
+  const photos = useBookStore((state) => state.photos)
+  const pages = useBookStore((state) => state.pages)
+  const bookSize = useBookStore((state) => state.bookSize)
+  const orientation = useBookStore((state) => state.orientation)
+  const spread = coverSpread(bookSize, orientation, Math.max(pages.length, 1))
+  const front = photos.find((photo) => photo.id === cover.frontPhotoId)
+  const back = photos.find((photo) => photo.id === cover.backPhotoId)
+  const spine = photos.find((photo) => photo.id === cover.spinePhotoId)
+  const src = (photo?: Photo) => photo?.thumbUrl || photo?.url
+  const stickers = cover.stickers ?? []
+  const panelStickers = (panel: CoverPanel) => stickers.filter((sticker) => sticker.panel === panel)
   return (
-    <span className="mini-jacket" style={{ background: cover.backgroundColor, color: cover.textColor }}>
-      <em>{cover.backText || '뒤'}</em>
-      <i />
-      <b>{cover.title || '앞'}</b>
-    </span>
+    <div
+      className="mini-jacket"
+      style={{
+        background: cover.backgroundColor,
+        color: cover.textColor,
+        aspectRatio: `${spread.spreadMm} / ${spread.heightMm}`,
+        gridTemplateColumns: `${spread.widthMm}fr ${Math.max(spread.spineMm, 6)}fr ${spread.widthMm}fr`,
+      }}
+    >
+      <div className="mini-jacket-panel">
+        {back && <img src={src(back)} alt="" />}
+        {(back || cover.backText) && <div className="mini-jacket-shade" />}
+        <div className="mini-jacket-copy">
+          {cover.backText ? <em>{cover.backText}</em> : !back ? <em className="is-placeholder">뒤</em> : null}
+        </div>
+        {panelStickers('back').map((sticker) => (
+          <span
+            key={sticker.id}
+            className="mini-sticker"
+            style={{
+              left: `${sticker.x * 100}%`,
+              top: `${sticker.y * 100}%`,
+              width: `${sticker.size * 100}%`,
+              transform: `translate(-50%, -50%) rotate(${sticker.rotation ?? 0}deg)`,
+            }}
+            aria-hidden
+          >
+            {sticker.emoji}
+          </span>
+        ))}
+      </div>
+      <div className="mini-jacket-spine">
+        {spine && <img src={src(spine)} alt="" />}
+        {spine && <div className="mini-jacket-shade" />}
+        <i>{cover.spineText || cover.title || year}</i>
+        {panelStickers('spine').map((sticker) => (
+          <span
+            key={sticker.id}
+            className="mini-sticker"
+            style={{
+              left: `${sticker.x * 100}%`,
+              top: `${sticker.y * 100}%`,
+              width: `${Math.max(sticker.size, 0.35) * 100}%`,
+              transform: `translate(-50%, -50%) rotate(${sticker.rotation ?? 0}deg)`,
+            }}
+            aria-hidden
+          >
+            {sticker.emoji}
+          </span>
+        ))}
+      </div>
+      <div className="mini-jacket-panel">
+        {front && <img src={src(front)} alt="" />}
+        <div className="mini-jacket-shade" />
+        <div className="mini-jacket-copy">
+          <b>{cover.title || year}</b>
+          {cover.subtitle && <small>{cover.subtitle}</small>}
+        </div>
+        {panelStickers('front').map((sticker) => (
+          <span
+            key={sticker.id}
+            className="mini-sticker"
+            style={{
+              left: `${sticker.x * 100}%`,
+              top: `${sticker.y * 100}%`,
+              width: `${sticker.size * 100}%`,
+              transform: `translate(-50%, -50%) rotate(${sticker.rotation ?? 0}deg)`,
+            }}
+            aria-hidden
+          >
+            {sticker.emoji}
+          </span>
+        ))}
+      </div>
+    </div>
   )
 }
 
-function CoverBar() {
-  const { photos, cover, updateCover } = useBookStore()
+function CoverBar({ stickerPanel, onStickerPanel }: { stickerPanel: CoverPanel | null; onStickerPanel: (panel: CoverPanel | null) => void }) {
+  const { photos, cover, updateCover, addCoverSticker } = useBookStore()
   return (
     <div className="cover-fields">
       <label>앞표지
         <select aria-label="앞표지 사진" value={cover.frontPhotoId ?? ''} onChange={(event) => updateCover({ frontPhotoId: event.target.value || undefined })}>
           <option value="">사진 없음</option>
+          {photos.map((photo) => <option key={photo.id} value={photo.id}>{photo.name}</option>)}
+        </select>
+      </label>
+      <label>책등
+        <select aria-label="책등 사진" value={cover.spinePhotoId ?? ''} onChange={(event) => updateCover({ spinePhotoId: event.target.value || undefined })}>
+          <option value="">색만</option>
           {photos.map((photo) => <option key={photo.id} value={photo.id}>{photo.name}</option>)}
         </select>
       </label>
@@ -1427,6 +2878,47 @@ function CoverBar() {
       </label>
       <label className="note-swatch">배경<input type="color" aria-label="표지 배경" value={cover.backgroundColor} onChange={(event) => updateCover({ backgroundColor: event.target.value })} /></label>
       <label className="note-swatch">글자<input type="color" aria-label="표지 글자" value={cover.textColor} onChange={(event) => updateCover({ textColor: event.target.value })} /></label>
+      <label className="note-opacity">제목
+        <input
+          type="range"
+          min={22}
+          max={64}
+          aria-label="제목 크기"
+          value={cover.titleSize ?? 42}
+          onChange={(event) => updateCover({ titleSize: Number(event.target.value) })}
+        />
+      </label>
+      <label className="note-opacity">부제
+        <input
+          type="range"
+          min={12}
+          max={28}
+          aria-label="부제 크기"
+          value={cover.subtitleSize ?? 16}
+          onChange={(event) => updateCover({ subtitleSize: Number(event.target.value) })}
+        />
+      </label>
+      <div className="cover-sticker-tools">
+        {(['front', 'spine', 'back'] as CoverPanel[]).map((panel) => (
+          <button
+            key={panel}
+            type="button"
+            className={stickerPanel === panel ? 'active' : ''}
+            onClick={() => onStickerPanel(stickerPanel === panel ? null : panel)}
+          >
+            {panel === 'front' ? '앞 스티커' : panel === 'spine' ? '책등 스티커' : '뒤 스티커'}
+          </button>
+        ))}
+      </div>
+      {stickerPanel && (
+        <StickerPicker
+          onPick={(emoji) => {
+            addCoverSticker(stickerPanel, emoji)
+            onStickerPanel(null)
+          }}
+          onClose={() => onStickerPanel(null)}
+        />
+      )}
     </div>
   )
 }
@@ -1437,18 +2929,22 @@ function BookJacket({ year, editable = false, printUrls, printing = false }: {
   printUrls?: Record<string, string>
   printing?: boolean
 }) {
-  const { cover, updateCover, photos, pages, bookSize, orientation } = useBookStore()
+  const { cover, updateCover, updateCoverSticker, removeCoverSticker, photos, pages, bookSize, orientation } = useBookStore()
   const spread = coverSpread(bookSize, orientation, Math.max(pages.length, 1))
   const front = photos.find((photo) => photo.id === cover.frontPhotoId)
   const back = photos.find((photo) => photo.id === cover.backPhotoId)
+  const spine = photos.find((photo) => photo.id === cover.spinePhotoId)
   const picture = (photo?: Photo) => photo && (printing && printUrls?.[photo.id] ? printUrls[photo.id] : (photo.thumbUrl || photo.url))
   const style = {
     '--page-ratio': spread.widthMm / spread.heightMm,
     '--jacket-ratio': spread.spreadMm / spread.heightMm,
+    '--cover-title-size': `${cover.titleSize ?? 42}px`,
+    '--cover-subtitle-size': `${cover.subtitleSize ?? 16}px`,
     background: cover.backgroundColor,
     color: cover.textColor,
     gridTemplateColumns: `${spread.widthMm}fr ${spread.spineMm}fr ${spread.widthMm}fr`,
   } as React.CSSProperties
+  const stickers = cover.stickers ?? []
   return (
     <article className="book-jacket" style={style} data-export-page={printing ? 'jacket' : undefined}>
       <section
@@ -1467,11 +2963,22 @@ function BookJacket({ year, editable = false, printUrls, printing = false }: {
             <textarea aria-label="뒤표지 글" value={cover.backText} placeholder="뒤표지에 남길 말" onChange={(event) => updateCover({ backText: event.target.value })} />
           ) : cover.backText && <p>{cover.backText}</p>}
         </div>
+        <CoverStickersLayer panel="back" stickers={stickers} editable={editable} update={updateCoverSticker} remove={removeCoverSticker} />
       </section>
-      <section className="jacket-panel jacket-spine">
+      <section
+        className="jacket-panel jacket-spine"
+        onDragOver={(event) => editable && event.preventDefault()}
+        onDrop={(event) => {
+          const id = event.dataTransfer.getData('photo/id')
+          if (id) updateCover({ spinePhotoId: id })
+        }}
+      >
+        {spine && <img src={picture(spine)} alt="" />}
+        {spine && <div className="jacket-shade" />}
         {editable ? (
           <input aria-label="책등" value={cover.spineText} placeholder={cover.title || `${year}`} onChange={(event) => updateCover({ spineText: event.target.value })} />
         ) : <b>{cover.spineText || cover.title || year}</b>}
+        <CoverStickersLayer panel="spine" stickers={stickers} editable={editable} update={updateCoverSticker} remove={removeCoverSticker} />
       </section>
       <section
         className="jacket-panel jacket-front"
@@ -1497,6 +3004,7 @@ function BookJacket({ year, editable = false, printUrls, printing = false }: {
             </>
           )}
         </div>
+        <CoverStickersLayer panel="front" stickers={stickers} editable={editable} update={updateCoverSticker} remove={removeCoverSticker} />
       </section>
     </article>
   )
@@ -1624,17 +3132,15 @@ function photoStyle(
   photo: Photo,
   rect?: { width: number; height: number },
   pageRatio = 1,
-  preserveAspect = true,
+  _preserveAspect = true,
 ): React.CSSProperties {
   const crop = photo.crop
   const focal = photo.analysis?.focalPoint
   const rotation = ((photo.rotation ?? 0) % 360 + 360) % 360
   const swapped = rotation === 90 || rotation === 270
   const slotRatio = rect ? (rect.width * pageRatio) / Math.max(rect.height, 0.001) : undefined
-  const photoRatio = swapped ? photo.height / photo.width : photo.width / photo.height
-  const cropAmount = slotRatio ? 1 - Math.min(slotRatio / photoRatio, photoRatio / slotRatio) : 0
-  const fitContain = preserveAspect && cropAmount > 0.15
   const zoom = crop?.zoom ?? 1
+  // 칸을 비율에 맞게 나눈 뒤 cover로 페이지를 빈틈없이 채움 (여백 contain 사용 안 함)
   const fillScale = swapped && slotRatio ? Math.max(slotRatio, 1 / slotRatio) : swapped ? Math.max(pageRatio, 1 / pageRatio) : 1
   const scale = fillScale * zoom
   const transforms = [
@@ -1643,8 +3149,7 @@ function photoStyle(
   ].filter(Boolean)
   return {
     objectPosition: `${(crop?.x ?? focal?.x ?? 0.5) * 100}% ${(crop?.y ?? focal?.y ?? 0.5) * 100}%`,
-    objectFit: fitContain ? 'contain' : 'cover',
-    background: fitContain ? '#eee8de' : undefined,
+    objectFit: 'cover',
     transform: transforms.length ? transforms.join(' ') : undefined,
     transformOrigin: rotation
       ? 'center center'
@@ -1928,6 +3433,7 @@ function photoHoldLabel(excludeReason?: ExcludeReason, holdReason?: HoldReason) 
   if (holdReason === 'budget') return '페이지 한도'
   if (holdReason === 'date') return '숨긴 날짜'
   if (holdReason === 'face') return '숨긴 얼굴'
+  if (holdReason === 'people') return '선택 인물'
   return ''
 }
 

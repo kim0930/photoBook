@@ -5,13 +5,18 @@ import { scoreQuality, signalExclude } from './signals'
 export interface BookFilter {
   hiddenRanges: HiddenRange[]
   faceGroups: FaceGroup[]
+  focusFaceIds?: string[]
 }
 
 export const EMPTY_BOOK_FILTER: BookFilter = { hiddenRanges: [], faceGroups: [] }
 
 export function selectForBook(photos: Photo[], chapters: Chapter[], filter: BookFilter = EMPTY_BOOK_FILTER) {
   const hiddenFaces = new Set(filter.faceGroups.filter((group) => group.hidden).flatMap((group) => group.photoIds))
-  let ranked = photos.map((photo) => markPhoto(photo, filter.hiddenRanges, hiddenFaces))
+  const focusIds = (filter.focusFaceIds ?? []).filter((id) => filter.faceGroups.some((group) => group.id === id && !group.hidden))
+  const focusPhotos = focusIds.length
+    ? new Set(filter.faceGroups.filter((group) => focusIds.includes(group.id)).flatMap((group) => group.photoIds))
+    : undefined
+  let ranked = photos.map((photo) => markPhoto(photo, filter.hiddenRanges, hiddenFaces, focusPhotos))
   const byId = () => new Map(ranked.map((photo) => [photo.id, photo]))
 
   while (estimatePages(chapters, byId()) > MAX_PAGES) {
@@ -45,11 +50,14 @@ export function bookPhoto(photo: Photo | undefined): photo is Photo {
   return !photo.excludeReason && photo.burstBest !== false
 }
 
-function markPhoto(photo: Photo, ranges: HiddenRange[], hiddenFaces: Set<string>): Photo {
+function markPhoto(photo: Photo, ranges: HiddenRange[], hiddenFaces: Set<string>, focusPhotos?: Set<string>): Photo {
   const quality = photo.quality ?? scoreQuality(photo)
   if (photo.omitted) return { ...photo, quality, inBook: false, holdReason: undefined }
   if (inHiddenRange(photo, ranges)) return { ...photo, quality, inBook: false, holdReason: 'date' }
   if (hiddenFaces.has(photo.id)) return { ...photo, quality, inBook: false, holdReason: 'face' }
+  if (focusPhotos && !focusPhotos.has(photo.id) && !photo.forcedIn) {
+    return { ...photo, quality, inBook: false, holdReason: 'people' }
+  }
   if (!photo.forcedIn && (photo.excludeReason || photo.burstBest === false)) {
     return {
       ...photo,

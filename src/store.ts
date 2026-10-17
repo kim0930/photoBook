@@ -1,15 +1,17 @@
 import { create } from 'zustand'
 import { selectForBook, type BookFilter } from './curate/bookSelection'
 import { ensureMonthChapters } from './chapters/tripDetection'
-import { db, persistCuration, saveCover, saveCurationSettings, saveDrawings, saveFaceGroups, savePageCaption, savePageNotes, syncChapters } from './db'
-import { avoidObstacles, buildPages, computeAdaptiveLayout, type LayoutId } from './layout/autoLayout'
-import { BOOK_SIZES } from './settings/bookSize'
-import type { BookCoverDesign, BookPage, BookSize, Chapter, CurationSettings, DrawStroke, FaceGroup, FlowAspect, PageCaption, PageNote, Photo, PhotoAnalysis, PhotoCrop, PhotoFrame, PhotoSize } from './types'
+import { clearBookLayout, db, deletePhotoBinary, getActiveBookId, persistCuration, saveBookLayout, saveCover, saveCurationSettings, saveDrawings, saveFaceGroups, savePageCaption, savePageCompleted, savePageMap, savePageNotes, savePageStickers, syncBookMetaFromPhotos, syncChapters } from './db'
+import { avoidObstacles, buildPages, computeAdaptiveLayout, ensureYearFrontPages, makeYearChapter, YEAR_CHAPTER_ID, type LayoutId } from './layout/autoLayout'
+import { BOOK_SIZES, MAX_PAGES } from './settings/bookSize'
+import type { BookCoverDesign, BookPage, BookSize, Chapter, CoverSticker, CurationSettings, DrawStroke, FaceGroup, FlowAspect, PageCaption, PageMapWidget, PageNote, PageSticker, Photo, PhotoAnalysis, PhotoCrop, PhotoFrame, PhotoSize } from './types'
 
 const cropSaveTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const noteSaveTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const drawingSaveTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const captionSaveTimers = new Map<string, ReturnType<typeof setTimeout>>()
+const stickerSaveTimers = new Map<string, ReturnType<typeof setTimeout>>()
+const mapSaveTimers = new Map<string, ReturnType<typeof setTimeout>>()
 let coverSaveTimer: ReturnType<typeof setTimeout> | undefined
 const NOTE_COLORS = ['yellow', 'pink', 'blue', 'cream'] as const
 const MEMO_INK: Record<(typeof NOTE_COLORS)[number], [string, string]> = {
@@ -26,6 +28,9 @@ export const EMPTY_COVER: BookCoverDesign = {
   backText: '',
   backgroundColor: '#2c2824',
   textColor: '#f6f1e8',
+  titleSize: 42,
+  subtitleSize: 16,
+  stickers: [],
 }
 
 interface Snapshot {
@@ -43,6 +48,8 @@ interface BookState {
   pageNotes: Record<string, PageNote[]>
   drawings: Record<string, DrawStroke[]>
   pageCaptions: Record<string, PageCaption>
+  pageStickers: Record<string, PageSticker[]>
+  pageMaps: Record<string, PageMapWidget>
   cover: BookCoverDesign
   selectedPageId?: string
   bookSize: BookSize
@@ -52,11 +59,22 @@ interface BookState {
   layoutRevision: number
   layoutOverrides: Record<string, LayoutId>
   flowAspectModes: Record<string, FlowAspect>
+  completedPages: Record<string, boolean>
   history: Snapshot[]
   curation: CurationSettings
   faceGroups: FaceGroup[]
   setLibrary: (photos: Photo[], chapters: Chapter[]) => void
+  setPageCompleted: (pageId: string, completed: boolean) => void
   applyCuration: (photos: Photo[]) => void
+  /** 페이지 배치는 유지한 채 신호·제외 필드만 갱신 */
+  patchPhotoSignals: (photos: Photo[]) => void
+  restoreBookLayout: (snapshot: {
+    pages: BookPage[]
+    layoutOverrides: Record<string, string>
+    flowAspectModes: Record<string, FlowAspect>
+    layoutRevision: number
+    selectedPageId?: string
+  }) => void
   includePhotos: (ids: string[]) => void
   hideDateRange: (start: string, end: string) => void
   removeHiddenRange: (id: string) => void
@@ -64,12 +82,16 @@ interface BookState {
   setFaceGroups: (groups: FaceGroup[]) => void
   renameFaceGroup: (id: string, name: string) => void
   setFaceGroupHidden: (id: string, hidden: boolean) => void
+  toggleFocusFace: (id: string) => void
+  clearFocusFaces: () => void
   removeFacePhoto: (groupId: string, photoId: string) => void
   setPhotoText: (id: string, ocrText: string, document: boolean) => void
   addPhotos: (photos: Photo[]) => void
   removePhoto: (id: string) => void
+  removePhotos: (ids: string[]) => void
   unplacePhoto: (id: string) => void
   removePage: (pageId: string) => void
+  addBlankPage: (afterPageId?: string) => void
   resizePhoto: (id: string, size: PhotoSize) => void
   setPhotoWeight: (id: string, weight: number) => void
   updatePhotoFrame: (id: string, frame: PhotoFrame, commit?: boolean, bringToFront?: boolean) => void
@@ -90,6 +112,15 @@ interface BookState {
   addPageNote: (pageId: string) => void
   updatePageNote: (pageId: string, noteId: string, patch: Partial<PageNote>) => void
   removePageNote: (pageId: string, noteId: string) => void
+  addPageSticker: (pageId: string, emoji: string) => void
+  updatePageSticker: (pageId: string, stickerId: string, patch: Partial<PageSticker>) => void
+  removePageSticker: (pageId: string, stickerId: string) => void
+  addPageMap: (pageId: string) => void
+  updatePageMap: (pageId: string, patch: Partial<PageMapWidget>) => void
+  removePageMap: (pageId: string) => void
+  addCoverSticker: (panel: CoverSticker['panel'], emoji: string) => void
+  updateCoverSticker: (stickerId: string, patch: Partial<CoverSticker>) => void
+  removeCoverSticker: (stickerId: string) => void
   addStroke: (pageId: string, stroke: DrawStroke) => void
   undoStroke: (pageId: string) => void
   clearStrokes: (pageId: string) => void
@@ -106,7 +137,16 @@ function bookFilter(state: { curation: CurationSettings; faceGroups: FaceGroup[]
   return {
     hiddenRanges: state.curation.hiddenRanges,
     faceGroups: state.curation.faceGroupsEnabled ? state.faceGroups : [],
+    focusFaceIds: state.curation.faceGroupsEnabled ? state.curation.focusFaceIds : [],
   }
+}
+
+function isPageCompleted(state: { completedPages: Record<string, boolean>; pages: BookPage[] }, pageId?: string) {
+  return Boolean(pageId && state.completedPages[pageId])
+}
+
+function pageIdForPhoto(state: { pages: BookPage[] }, photoId: string) {
+  return state.pages.find((page) => page.photoIds.includes(photoId))?.id
 }
 
 function recompute(
@@ -118,12 +158,17 @@ function recompute(
   filter: BookFilter = { hiddenRanges: [], faceGroups: [] },
 ) {
   const selected = selectForBook(photos, chapters, filter)
-  const pages = buildPages(selected.chapters, selected.photos, revision).map((page) => ({
+  const yearChapter = makeYearChapter(selected.photos, selected.chapters)
+  const nextChapters = [
+    yearChapter,
+    ...selected.chapters.filter((chapter) => chapter.id !== YEAR_CHAPTER_ID),
+  ]
+  const pages = buildPages(nextChapters, selected.photos, revision).map((page) => ({
     ...page,
     layoutId: overrides[page.id] ?? page.layoutId,
     flowAspect: flowAspectModes[page.id] ?? 'locked',
   }))
-  return { photos: selected.photos, chapters: selected.chapters, pages }
+  return { photos: selected.photos, chapters: nextChapters, pages }
 }
 
 function lockedFrames(photos: Photo[], page: BookPage | undefined, exceptId?: string) {
@@ -145,7 +190,7 @@ function withHistory(state: BookState) {
   }]
 }
 
-const EMPTY_CURATION: CurationSettings = { faceGroupsEnabled: false, hiddenRanges: [] }
+const EMPTY_CURATION: CurationSettings = { faceGroupsEnabled: false, hiddenRanges: [], focusFaceIds: [] }
 
 export const useBookStore = create<BookState>((set, get) => ({
   photos: [],
@@ -154,6 +199,8 @@ export const useBookStore = create<BookState>((set, get) => ({
   pageNotes: {},
   drawings: {},
   pageCaptions: {},
+  pageStickers: {},
+  pageMaps: {},
   cover: EMPTY_COVER,
   bookSize: BOOK_SIZES[0],
   orientation: 'portrait',
@@ -162,6 +209,7 @@ export const useBookStore = create<BookState>((set, get) => ({
   layoutRevision: 0,
   layoutOverrides: {},
   flowAspectModes: {},
+  completedPages: {},
   history: [],
   curation: EMPTY_CURATION,
   faceGroups: [],
@@ -170,8 +218,53 @@ export const useBookStore = create<BookState>((set, get) => ({
     const laid = recompute(photos, nextChapters, 0, {}, {}, bookFilter(get()))
     void syncChapters(laid.chapters)
     void persistCuration(laid.photos)
-    set({ ...laid, selectedPageId: laid.pages[0]?.id, history: [], layoutRevision: 0, layoutOverrides: {} })
+    void clearBookLayout()
+    const bookId = getActiveBookId()
+    if (bookId) void syncBookMetaFromPhotos(bookId, laid.photos)
+    set({ ...laid, selectedPageId: laid.pages[0]?.id, history: [], layoutRevision: 0, layoutOverrides: {}, flowAspectModes: {}, completedPages: {} })
   },
+  restoreBookLayout: (snapshot) =>
+    set((state) => {
+      const layoutOverrides = snapshot.layoutOverrides as Record<string, LayoutId>
+      const known = new Set(state.photos.map((photo) => photo.id))
+      const restored = snapshot.pages
+        .map((page) => ({
+          ...page,
+          photoIds: page.photoIds.filter((id) => known.has(id)),
+          layoutId: layoutOverrides[page.id] ?? page.layoutId,
+          flowAspect: snapshot.flowAspectModes[page.id] ?? page.flowAspect ?? 'locked',
+        }))
+        .filter((page) => page.type !== 'photos' || page.photoIds.length > 0)
+      const monthChapters = state.chapters.filter((chapter) => chapter.id !== YEAR_CHAPTER_ID)
+      const pages = ensureYearFrontPages(restored, state.photos, monthChapters)
+      if (!pages.length) return state
+      const yearChapter = makeYearChapter(state.photos, monthChapters)
+      const chapters = [
+        yearChapter,
+        ...monthChapters,
+      ]
+      const selectedPageId = snapshot.selectedPageId && pages.some((page) => page.id === snapshot.selectedPageId)
+        ? snapshot.selectedPageId
+        : pages[0]?.id
+      return {
+        pages,
+        chapters,
+        layoutOverrides,
+        flowAspectModes: snapshot.flowAspectModes,
+        layoutRevision: snapshot.layoutRevision,
+        selectedPageId,
+        history: [],
+      }
+    }),
+  setPageCompleted: (pageId, completed) =>
+    set((state) => {
+      if (!state.pages.some((page) => page.id === pageId)) return state
+      const completedPages = { ...state.completedPages }
+      if (completed) completedPages[pageId] = true
+      else delete completedPages[pageId]
+      void savePageCompleted(pageId, completed)
+      return { completedPages }
+    }),
   applyCuration: (incoming) =>
     set((state) => {
       const incomingIds = new Set(incoming.map((photo) => photo.id))
@@ -182,8 +275,32 @@ export const useBookStore = create<BookState>((set, get) => ({
       const chapters = ensureMonthChapters(photos, state.chapters)
       const laid = recompute(photos, chapters, state.layoutRevision, state.layoutOverrides, state.flowAspectModes, bookFilter(state))
       void syncChapters(laid.chapters)
+      const bookId = getActiveBookId()
+      if (bookId) void syncBookMetaFromPhotos(bookId, laid.photos)
       void persistCuration(laid.photos)
       return { ...laid, history: withHistory(state) }
+    }),
+  patchPhotoSignals: (incoming) =>
+    set((state) => {
+      const byId = new Map(incoming.map((photo) => [photo.id, photo]))
+      const photos = state.photos.map((photo) => {
+        const next = byId.get(photo.id)
+        if (!next) return photo
+        return {
+          ...photo,
+          quality: next.quality,
+          thumbHash: next.thumbHash,
+          burstId: next.burstId,
+          burstBest: next.burstBest,
+          eventId: next.eventId,
+          excludeReason: next.excludeReason,
+          faceQuality: next.faceQuality,
+          holdReason: next.holdReason,
+          inBook: next.inBook,
+        }
+      })
+      void persistCuration(photos)
+      return { photos }
     }),
   includePhotos: (ids) =>
     set((state) => {
@@ -225,7 +342,11 @@ export const useBookStore = create<BookState>((set, get) => ({
   setFaceGroupsEnabled: (enabled) =>
     set((state) => {
       const faceGroups = enabled ? state.faceGroups : []
-      const curation = { ...state.curation, faceGroupsEnabled: enabled }
+      const curation = {
+        ...state.curation,
+        faceGroupsEnabled: enabled,
+        focusFaceIds: enabled ? state.curation.focusFaceIds ?? [] : [],
+      }
       const photos = enabled ? state.photos : state.photos.map((photo) => ({ ...photo, faceQuality: undefined }))
       void saveCurationSettings(curation)
       void saveFaceGroups(faceGroups)
@@ -248,9 +369,30 @@ export const useBookStore = create<BookState>((set, get) => ({
   setFaceGroupHidden: (id, hidden) =>
     set((state) => {
       const faceGroups = state.faceGroups.map((group) => (group.id === id ? { ...group, hidden } : group))
+      const focusFaceIds = hidden
+        ? (state.curation.focusFaceIds ?? []).filter((faceId) => faceId !== id)
+        : state.curation.focusFaceIds
+      const curation = { ...state.curation, focusFaceIds }
       void saveFaceGroups(faceGroups)
-      const laid = recompute(state.photos, state.chapters, state.layoutRevision, state.layoutOverrides, state.flowAspectModes, bookFilter({ ...state, faceGroups }))
-      return { faceGroups, ...laid }
+      void saveCurationSettings(curation)
+      const laid = recompute(state.photos, state.chapters, state.layoutRevision, state.layoutOverrides, state.flowAspectModes, bookFilter({ ...state, curation, faceGroups }))
+      return { faceGroups, curation, ...laid }
+    }),
+  toggleFocusFace: (id) =>
+    set((state) => {
+      const current = state.curation.focusFaceIds ?? []
+      const focusFaceIds = current.includes(id) ? current.filter((faceId) => faceId !== id) : [...current, id]
+      const curation = { ...state.curation, focusFaceIds }
+      void saveCurationSettings(curation)
+      const laid = recompute(state.photos, state.chapters, state.layoutRevision, state.layoutOverrides, state.flowAspectModes, bookFilter({ ...state, curation }))
+      return { curation, ...laid }
+    }),
+  clearFocusFaces: () =>
+    set((state) => {
+      const curation = { ...state.curation, focusFaceIds: [] }
+      void saveCurationSettings(curation)
+      const laid = recompute(state.photos, state.chapters, state.layoutRevision, state.layoutOverrides, state.flowAspectModes, bookFilter({ ...state, curation }))
+      return { curation, ...laid }
     }),
   removeFacePhoto: (groupId, photoId) =>
     set((state) => {
@@ -283,21 +425,54 @@ export const useBookStore = create<BookState>((set, get) => ({
       void persistCuration(laid.photos)
       return { ...laid, history: withHistory(state) }
     }),
-  removePhoto: (id) =>
+  removePhoto: (id) => useBookStore.getState().removePhotos([id]),
+  removePhotos: (ids) =>
     set((state) => {
-      const photos = state.photos.filter((photo) => photo.id !== id)
-      const chapters = state.chapters.map((chapter) => ({
-        ...chapter,
-        photoIds: chapter.photoIds.filter((photoId) => photoId !== id),
-        coverPhotoId: chapter.coverPhotoId === id ? chapter.photoIds.find((p) => p !== id) : chapter.coverPhotoId,
-      }))
-      void db.photos.delete(id)
+      const remove = new Set(ids.filter(Boolean))
+      if (!remove.size) return state
+      const removedPhotos = state.photos.filter((photo) => remove.has(photo.id))
+      for (const photo of removedPhotos) {
+        if (photo.url?.startsWith('blob:')) URL.revokeObjectURL(photo.url)
+        if (photo.thumbUrl?.startsWith('blob:') && photo.thumbUrl !== photo.url) URL.revokeObjectURL(photo.thumbUrl)
+      }
+      const photos = state.photos.filter((photo) => !remove.has(photo.id))
+      const chapters = state.chapters.map((chapter) => {
+        const photoIds = chapter.photoIds.filter((photoId) => !remove.has(photoId))
+        return {
+          ...chapter,
+          photoIds,
+          coverPhotoId: chapter.coverPhotoId && remove.has(chapter.coverPhotoId) ? photoIds[0] : chapter.coverPhotoId,
+        }
+      })
+      const coverChanged = Boolean(
+        (state.cover.frontPhotoId && remove.has(state.cover.frontPhotoId))
+        || (state.cover.backPhotoId && remove.has(state.cover.backPhotoId))
+        || (state.cover.spinePhotoId && remove.has(state.cover.spinePhotoId)),
+      )
+      const cover = coverChanged
+        ? {
+            ...state.cover,
+            frontPhotoId: state.cover.frontPhotoId && remove.has(state.cover.frontPhotoId) ? undefined : state.cover.frontPhotoId,
+            backPhotoId: state.cover.backPhotoId && remove.has(state.cover.backPhotoId) ? undefined : state.cover.backPhotoId,
+            spinePhotoId: state.cover.spinePhotoId && remove.has(state.cover.spinePhotoId) ? undefined : state.cover.spinePhotoId,
+          }
+        : state.cover
+      if (coverChanged) {
+        if (coverSaveTimer) clearTimeout(coverSaveTimer)
+        coverSaveTimer = setTimeout(() => { void saveCover(cover) }, 250)
+      }
+      // IndexedDB에 둔 복사본만 지움 — 기기/폴더의 원본 파일은 건드리지 않음
+      for (const id of remove) {
+        void db.photos.delete(id)
+        void deletePhotoBinary(id)
+      }
       const laid = recompute(photos, chapters, state.layoutRevision, state.layoutOverrides, state.flowAspectModes, bookFilter(state))
       void syncChapters(laid.chapters)
-      return { ...laid, history: withHistory(state) }
+      return { ...laid, cover, history: withHistory(state) }
     }),
   unplacePhoto: (id) =>
     set((state) => {
+      if (isPageCompleted(state, pageIdForPhoto(state, id))) return state
       const photos = state.photos.map((photo) => (photo.id === id ? { ...photo, omitted: true } : photo))
       void db.photos.update(id, { omitted: true })
       const chapters = state.chapters
@@ -321,6 +496,46 @@ export const useBookStore = create<BookState>((set, get) => ({
         chapters,
         pages,
         selectedPageId: pages.some((page) => page.id === state.selectedPageId) ? state.selectedPageId : pages[0]?.id,
+        history: withHistory(state),
+      }
+    }),
+  addBlankPage: (afterPageId) =>
+    set((state) => {
+      if (state.pages.length >= MAX_PAGES) return state
+      const bodyChapters = state.chapters.filter((chapter) => chapter.id !== YEAR_CHAPTER_ID)
+      if (!bodyChapters.length) return state
+
+      const anchorId = afterPageId ?? state.selectedPageId
+      let anchorIndex = anchorId ? state.pages.findIndex((page) => page.id === anchorId) : -1
+      let anchor = anchorIndex >= 0 ? state.pages[anchorIndex] : undefined
+
+      if (!anchor || anchor.chapterId === YEAR_CHAPTER_ID) {
+        const firstBody = state.pages.findIndex((page) => page.chapterId !== YEAR_CHAPTER_ID)
+        if (firstBody < 0) {
+          anchorIndex = state.pages.length - 1
+          anchor = undefined
+        } else {
+          anchorIndex = firstBody - 1
+          anchor = state.pages[firstBody]
+        }
+      }
+
+      const chapterId = anchor && anchor.chapterId !== YEAR_CHAPTER_ID
+        ? anchor.chapterId
+        : bodyChapters[0].id
+      const insertAt = Math.max(0, anchorIndex + 1)
+      const newPage: BookPage = {
+        id: `blank-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+        chapterId,
+        type: 'photos',
+        photoIds: [],
+        layoutId: 'adaptive-flow',
+        flowAspect: 'locked',
+      }
+      return {
+        pages: [...state.pages.slice(0, insertAt), newPage, ...state.pages.slice(insertAt)],
+        selectedPageId: newPage.id,
+        layoutOverrides: { ...state.layoutOverrides, [newPage.id]: 'adaptive-flow' as LayoutId },
         history: withHistory(state),
       }
     }),
@@ -357,19 +572,30 @@ export const useBookStore = create<BookState>((set, get) => ({
       void savePageNotes(pageId, [])
       void saveDrawings(pageId, [])
       void savePageCaption(pageId, {})
+      void savePageStickers(pageId, [])
+      void savePageMap(pageId, undefined)
+      void savePageCompleted(pageId, false)
+      const { [pageId]: _notes, ...pageNotes } = state.pageNotes
+      const { [pageId]: _draw, ...drawings } = state.drawings
+      const { [pageId]: _cap, ...pageCaptions } = state.pageCaptions
+      const { [pageId]: _stick, ...pageStickers } = state.pageStickers
+      const { [pageId]: _map, ...pageMaps } = state.pageMaps
+      const { [pageId]: _done, ...completedPages } = state.completedPages
       const selectedPageId = state.selectedPageId === pageId
         ? (pages[index] ?? pages[index - 1] ?? pages[0])?.id
         : (pages.some((item) => item.id === state.selectedPageId) ? state.selectedPageId : pages[0]?.id)
-      return { photos, chapters, pages, selectedPageId, history: withHistory(state) }
+      return { photos, chapters, pages, pageNotes, drawings, pageCaptions, pageStickers, pageMaps, completedPages, selectedPageId, history: withHistory(state) }
     }),
   resizePhoto: (id, size) =>
     set((state) => {
+      if (isPageCompleted(state, pageIdForPhoto(state, id))) return state
       const photos = state.photos.map((photo) => (photo.id === id ? { ...photo, size } : photo))
       const laid = recompute(photos, state.chapters, state.layoutRevision, state.layoutOverrides, state.flowAspectModes, bookFilter(state))
       return { ...laid, history: withHistory(state) }
     }),
   setPhotoWeight: (id, weight) =>
     set((state) => {
+      if (isPageCompleted(state, pageIdForPhoto(state, id))) return state
       const layoutWeight = Math.max(0.35, Math.min(3.5, weight))
       const photos = state.photos.map((photo) =>
         photo.id === id ? { ...photo, layoutWeight, manuallyPositioned: true } : photo,
@@ -386,6 +612,7 @@ export const useBookStore = create<BookState>((set, get) => ({
     }),
   updatePhotoFrame: (id, frame, commit = false, bringToFront = false) =>
     set((state) => {
+      if (isPageCompleted(state, pageIdForPhoto(state, id))) return state
       const currentPriority = Math.max(0, ...state.photos.map((photo) => photo.framePriority ?? 0))
       const page = state.pages.find((candidate) => candidate.photoIds.includes(id))
       const freeFrame = avoidObstacles(frame, lockedFrames(state.photos, page, id))
@@ -420,8 +647,9 @@ export const useBookStore = create<BookState>((set, get) => ({
   updatePhotoFrames: (entries, commit = false) =>
     set((state) => {
       if (!entries.length) return state
+      const page = state.pages.find((candidate) => candidate.photoIds.some((id) => entries.some((entry) => entry.id === id)))
+      if (isPageCompleted(state, page?.id)) return state
       const byId = new Map(entries.map((entry) => [entry.id, entry.frame]))
-      const page = state.pages.find((candidate) => candidate.photoIds.some((id) => byId.has(id)))
       const obstacles = lockedFrames(state.photos, page)
       const photos = state.photos.map((photo) => {
         const frame = byId.get(photo.id)
@@ -444,6 +672,7 @@ export const useBookStore = create<BookState>((set, get) => ({
     }),
   setLayoutLock: (id, locked, frame) =>
     set((state) => {
+      if (isPageCompleted(state, pageIdForPhoto(state, id))) return state
       const photos = state.photos.map((photo) => {
         if (photo.id !== id) return photo
         if (!locked) return { ...photo, layoutLocked: false, freeFrame: undefined }
@@ -504,7 +733,7 @@ export const useBookStore = create<BookState>((set, get) => ({
       pages = pages.map((page) =>
         page.id === containingPage?.id ? { ...page, layoutId: 'adaptive-flow' } : page,
       )
-      void db.chapters.bulkPut(chapters)
+      void syncChapters(chapters)
       void db.photos.update(sourceId, { manuallyPositioned: true })
       return { photos, chapters, pages, layoutOverrides, history: withHistory(state) }
     }),
@@ -512,7 +741,7 @@ export const useBookStore = create<BookState>((set, get) => ({
     set((state) => {
       if (sourceId === targetId) return state
       const page = state.pages.find((item) => item.type === 'photos' && item.photoIds.includes(sourceId) && item.photoIds.includes(targetId))
-      if (!page) return state
+      if (!page || isPageCompleted(state, page.id)) return state
       const swapIds = (ids: string[]) => {
         const first = ids.indexOf(sourceId)
         const second = ids.indexOf(targetId)
@@ -549,7 +778,7 @@ export const useBookStore = create<BookState>((set, get) => ({
           void db.photos.update(photo.id, { freeFrame: photo.freeFrame, manuallyPositioned: true })
         }
       }
-      void db.chapters.bulkPut(chapters)
+      void syncChapters(chapters)
       return { photos, chapters, pages, history: withHistory(state) }
     }),
   setSelectedFrame: (id, dataUrl) =>
@@ -567,6 +796,7 @@ export const useBookStore = create<BookState>((set, get) => ({
     }),
   setPhotoCrop: (id, crop) =>
     set((state) => {
+      if (isPageCompleted(state, pageIdForPhoto(state, id))) return state
       const photos = state.photos.map((photo) => (photo.id === id ? { ...photo, crop } : photo))
       const existingTimer = cropSaveTimers.get(id)
       if (existingTimer) clearTimeout(existingTimer)
@@ -578,6 +808,7 @@ export const useBookStore = create<BookState>((set, get) => ({
     }),
   rotatePhoto: (id, delta = 90) =>
     set((state) => {
+      if (isPageCompleted(state, pageIdForPhoto(state, id))) return state
       const photos = state.photos.map((photo) => {
         if (photo.id !== id) return photo
         const next = ((((photo.rotation ?? 0) + delta) % 360) + 360) % 360 as 0 | 90 | 180 | 270
@@ -589,6 +820,7 @@ export const useBookStore = create<BookState>((set, get) => ({
     }),
   setPageLayout: (id, layoutId) =>
     set((state) => {
+      if (isPageCompleted(state, id)) return state
       const page = state.pages.find((candidate) => candidate.id === id)
       if (!page) return state
       const locked = page.photoIds.some((photoId) => state.photos.some((photo) => photo.id === photoId && photo.layoutLocked))
@@ -621,6 +853,7 @@ export const useBookStore = create<BookState>((set, get) => ({
     }),
   setPageFlowAspect: (pageId, mode) =>
     set((state) => {
+      if (isPageCompleted(state, pageId)) return state
       const target = state.pages.find((page) => page.id === pageId)
       const chosen = state.layoutOverrides[pageId]
       const useFlow = target?.type === 'photos' && (!chosen || chosen === 'adaptive-flow')
@@ -679,6 +912,7 @@ export const useBookStore = create<BookState>((set, get) => ({
   movePhoto: (photoId, targetPageId) =>
     set((state) => {
       if (state.photos.some((photo) => photo.id === photoId && photo.layoutLocked)) return state
+      if (isPageCompleted(state, targetPageId) || isPageCompleted(state, pageIdForPhoto(state, photoId))) return state
       const targetPage = state.pages.find((page) => page.id === targetPageId)
       if (!targetPage) return state
       const chapters = state.chapters.map((chapter) => {
@@ -697,6 +931,7 @@ export const useBookStore = create<BookState>((set, get) => ({
     }),
   addPhotoToPage: (photoId, pageId) =>
     set((state) => {
+      if (isPageCompleted(state, pageId) || isPageCompleted(state, pageIdForPhoto(state, photoId))) return state
       const targetPage = state.pages.find((page) => page.id === pageId)
       if (!targetPage || targetPage.type !== 'photos' || targetPage.photoIds.includes(photoId)) return state
       const chapters = state.chapters
@@ -754,6 +989,7 @@ export const useBookStore = create<BookState>((set, get) => ({
     }),
   addPageNote: (pageId) =>
     set((state) => {
+      if (isPageCompleted(state, pageId)) return state
       const existing = state.pageNotes[pageId] ?? []
       const offset = (existing.length % 4) * 0.05
       const tone = NOTE_COLORS[existing.length % NOTE_COLORS.length]
@@ -776,6 +1012,7 @@ export const useBookStore = create<BookState>((set, get) => ({
     }),
   updatePageNote: (pageId, noteId, patch) =>
     set((state) => {
+      if (isPageCompleted(state, pageId)) return state
       const notes = (state.pageNotes[pageId] ?? []).map((note) => (note.id === noteId ? { ...note, ...patch } : note))
       const pending = noteSaveTimers.get(pageId)
       if (pending) clearTimeout(pending)
@@ -784,26 +1021,131 @@ export const useBookStore = create<BookState>((set, get) => ({
     }),
   removePageNote: (pageId, noteId) =>
     set((state) => {
+      if (isPageCompleted(state, pageId)) return state
       const notes = (state.pageNotes[pageId] ?? []).filter((note) => note.id !== noteId)
       const pending = noteSaveTimers.get(pageId)
       if (pending) clearTimeout(pending)
       void savePageNotes(pageId, notes)
       return { pageNotes: { ...state.pageNotes, [pageId]: notes } }
     }),
+  addPageSticker: (pageId, emoji) =>
+    set((state) => {
+      if (isPageCompleted(state, pageId)) return state
+      const existing = state.pageStickers[pageId] ?? []
+      const offset = (existing.length % 5) * 0.04
+      const sticker: PageSticker = {
+        id: `sticker-${Date.now().toString(36)}-${existing.length}`,
+        emoji,
+        x: Math.min(0.78, 0.12 + offset),
+        y: Math.min(0.78, 0.18 + offset),
+        size: 0.12,
+        rotation: 0,
+      }
+      const stickers = [...existing, sticker]
+      void savePageStickers(pageId, stickers)
+      return { pageStickers: { ...state.pageStickers, [pageId]: stickers } }
+    }),
+  updatePageSticker: (pageId, stickerId, patch) =>
+    set((state) => {
+      if (isPageCompleted(state, pageId)) return state
+      const stickers = (state.pageStickers[pageId] ?? []).map((item) => (item.id === stickerId ? { ...item, ...patch } : item))
+      const pending = stickerSaveTimers.get(pageId)
+      if (pending) clearTimeout(pending)
+      stickerSaveTimers.set(pageId, setTimeout(() => { void savePageStickers(pageId, stickers) }, 250))
+      return { pageStickers: { ...state.pageStickers, [pageId]: stickers } }
+    }),
+  removePageSticker: (pageId, stickerId) =>
+    set((state) => {
+      if (isPageCompleted(state, pageId)) return state
+      const stickers = (state.pageStickers[pageId] ?? []).filter((item) => item.id !== stickerId)
+      const pending = stickerSaveTimers.get(pageId)
+      if (pending) clearTimeout(pending)
+      void savePageStickers(pageId, stickers)
+      return { pageStickers: { ...state.pageStickers, [pageId]: stickers } }
+    }),
+  addPageMap: (pageId) =>
+    set((state) => {
+      if (isPageCompleted(state, pageId) || state.pageMaps[pageId]) return state
+      const widget: PageMapWidget = {
+        id: `map-${Date.now().toString(36)}`,
+        x: 0.08,
+        y: 0.58,
+        width: 0.42,
+        height: 0.32,
+      }
+      void savePageMap(pageId, widget)
+      return { pageMaps: { ...state.pageMaps, [pageId]: widget } }
+    }),
+  updatePageMap: (pageId, patch) =>
+    set((state) => {
+      if (isPageCompleted(state, pageId)) return state
+      const current = state.pageMaps[pageId]
+      if (!current) return state
+      const widget = { ...current, ...patch }
+      const pending = mapSaveTimers.get(pageId)
+      if (pending) clearTimeout(pending)
+      mapSaveTimers.set(pageId, setTimeout(() => { void savePageMap(pageId, widget) }, 250))
+      return { pageMaps: { ...state.pageMaps, [pageId]: widget } }
+    }),
+  removePageMap: (pageId) =>
+    set((state) => {
+      if (isPageCompleted(state, pageId)) return state
+      const { [pageId]: _removed, ...rest } = state.pageMaps
+      const pending = mapSaveTimers.get(pageId)
+      if (pending) clearTimeout(pending)
+      void savePageMap(pageId, undefined)
+      return { pageMaps: rest }
+    }),
+  addCoverSticker: (panel, emoji) =>
+    set((state) => {
+      const existing = state.cover.stickers ?? []
+      const offset = (existing.length % 4) * 0.05
+      const sticker: CoverSticker = {
+        id: `cover-sticker-${Date.now().toString(36)}-${existing.length}`,
+        panel,
+        emoji,
+        x: Math.min(0.72, 0.18 + offset),
+        y: Math.min(0.72, 0.22 + offset),
+        size: 0.14,
+        rotation: 0,
+      }
+      const cover = { ...state.cover, stickers: [...existing, sticker] }
+      if (coverSaveTimer) clearTimeout(coverSaveTimer)
+      coverSaveTimer = setTimeout(() => { void saveCover(cover) }, 250)
+      return { cover }
+    }),
+  updateCoverSticker: (stickerId, patch) =>
+    set((state) => {
+      const stickers = (state.cover.stickers ?? []).map((item) => (item.id === stickerId ? { ...item, ...patch } : item))
+      const cover = { ...state.cover, stickers }
+      if (coverSaveTimer) clearTimeout(coverSaveTimer)
+      coverSaveTimer = setTimeout(() => { void saveCover(cover) }, 250)
+      return { cover }
+    }),
+  removeCoverSticker: (stickerId) =>
+    set((state) => {
+      const cover = { ...state.cover, stickers: (state.cover.stickers ?? []).filter((item) => item.id !== stickerId) }
+      if (coverSaveTimer) clearTimeout(coverSaveTimer)
+      coverSaveTimer = setTimeout(() => { void saveCover(cover) }, 250)
+      return { cover }
+    }),
   addStroke: (pageId, stroke) =>
     set((state) => {
+      if (isPageCompleted(state, pageId)) return state
       const strokes = [...(state.drawings[pageId] ?? []), stroke]
       scheduleDrawings(pageId, strokes)
       return { drawings: { ...state.drawings, [pageId]: strokes } }
     }),
   undoStroke: (pageId) =>
     set((state) => {
+      if (isPageCompleted(state, pageId)) return state
       const strokes = (state.drawings[pageId] ?? []).slice(0, -1)
       scheduleDrawings(pageId, strokes)
       return { drawings: { ...state.drawings, [pageId]: strokes } }
     }),
   clearStrokes: (pageId) =>
     set((state) => {
+      if (isPageCompleted(state, pageId)) return state
       scheduleDrawings(pageId, [])
       return { drawings: { ...state.drawings, [pageId]: [] } }
     }),
@@ -816,6 +1158,7 @@ export const useBookStore = create<BookState>((set, get) => ({
     }),
   updatePageCaption: (pageId, patch) =>
     set((state) => {
+      if (isPageCompleted(state, pageId)) return state
       const caption = { ...state.pageCaptions[pageId], ...patch }
       const pending = captionSaveTimers.get(pageId)
       if (pending) clearTimeout(pending)
@@ -846,6 +1189,34 @@ export const useBookStore = create<BookState>((set, get) => ({
       }
     }),
 }))
+
+let bookLayoutSaveTimer: ReturnType<typeof setTimeout> | undefined
+useBookStore.subscribe((state, previous) => {
+  if (
+    state.pages === previous.pages
+    && state.layoutOverrides === previous.layoutOverrides
+    && state.flowAspectModes === previous.flowAspectModes
+    && state.layoutRevision === previous.layoutRevision
+    && state.selectedPageId === previous.selectedPageId
+  ) return
+  if (bookLayoutSaveTimer) clearTimeout(bookLayoutSaveTimer)
+  if (!state.pages.length) {
+    void clearBookLayout()
+    return
+  }
+  bookLayoutSaveTimer = setTimeout(() => {
+    const bookId = getActiveBookId()
+    if (!bookId) return
+    void saveBookLayout({
+      pages: state.pages,
+      layoutOverrides: state.layoutOverrides,
+      flowAspectModes: state.flowAspectModes,
+      layoutRevision: state.layoutRevision,
+      selectedPageId: state.selectedPageId,
+    }, bookId)
+    void syncBookMetaFromPhotos(bookId, state.photos)
+  }, 280)
+})
 
 export function currentState() {
   return getSafeState()

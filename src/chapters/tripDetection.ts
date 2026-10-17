@@ -117,7 +117,9 @@ export async function buildChapters(photos: Photo[], thresholdKm = 50): Promise<
 
 export function ensureMonthChapters(photos: Photo[], chapters: Chapter[]) {
   const photoIds = new Set(photos.map((photo) => photo.id))
-  const next = chapters.map((chapter) => ({
+  const next = chapters
+    .filter((chapter) => chapter.id !== 'year-book')
+    .map((chapter) => ({
     ...chapter,
     photoIds: chapter.photoIds.filter((id) => {
       const photo = photos.find((item) => item.id === id)
