@@ -30,16 +30,16 @@ jobs:
       - name: Install
         run: npm ci
 
+      # 빈 Secrets가 .env.production 값을 덮어쓰지 않도록, 값이 있을 때만 주입합니다.
       - name: Build
+        run: |
+          if [ -n "$ALLOWED_EMAILS" ]; then
+            export VITE_ALLOWED_EMAILS="$ALLOWED_EMAILS"
+          fi
+          npm run build
+          node -e "const fs=require('fs');const html=fs.readFileSync('dist/index.html','utf8');const m=html.match(/assets\\/index-[^\"']+\\.js/);if(!m) process.exit(1);const js=fs.readFileSync('dist/'+m[0],'utf8');if(!js.includes('easy-photobook')){console.error('Firebase config missing from build');process.exit(1)}"
         env:
-          VITE_FIREBASE_API_KEY: ${{ secrets.VITE_FIREBASE_API_KEY }}
-          VITE_FIREBASE_AUTH_DOMAIN: ${{ secrets.VITE_FIREBASE_AUTH_DOMAIN }}
-          VITE_FIREBASE_PROJECT_ID: ${{ secrets.VITE_FIREBASE_PROJECT_ID }}
-          VITE_FIREBASE_APP_ID: ${{ secrets.VITE_FIREBASE_APP_ID }}
-          VITE_FIREBASE_MESSAGING_SENDER_ID: ${{ secrets.VITE_FIREBASE_MESSAGING_SENDER_ID }}
-          VITE_FIREBASE_STORAGE_BUCKET: ${{ secrets.VITE_FIREBASE_STORAGE_BUCKET }}
-          VITE_ALLOWED_EMAILS: ${{ secrets.VITE_ALLOWED_EMAILS }}
-        run: npm run build
+          ALLOWED_EMAILS: ${{ secrets.VITE_ALLOWED_EMAILS }}
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
