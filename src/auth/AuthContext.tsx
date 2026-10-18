@@ -14,7 +14,8 @@ import {
   useState,
   type ReactNode,
 } from 'react'
-import { getFirebaseAuth, isEmailAllowed, isFirebaseConfigured } from './firebase'
+import { getFirebaseAuth, isFirebaseConfigured } from './firebase'
+import { isEmailAllowedAsync } from './invites'
 
 type AuthStatus = 'loading' | 'signedOut' | 'signedIn' | 'denied' | 'misconfigured'
 
@@ -40,24 +41,58 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setStatus('misconfigured')
       return
     }
+
+    let cancelled = false
+    let generation = 0
     const auth = getFirebaseAuth()
-    return onAuthStateChanged(auth, async (next) => {
-      setError('')
-      if (!next) {
-        setUser(null)
-        setStatus('signedOut')
-        return
-      }
-      if (!isEmailAllowed(next.email)) {
-        setUser(null)
-        setStatus('denied')
-        setError(`${next.email ?? '이 계정'}은 초대되지 않은 사용자입니다.`)
-        try { await signOut(auth) } catch { /* ignore */ }
-        return
-      }
-      setUser(next)
-      setStatus('signedIn')
+
+    // Auth / Firestore가 응답하지 않아도 로딩에 갇히지 않도록 한다.
+    const safetyTimer = window.setTimeout(() => {
+      if (cancelled) return
+      setStatus((current) => (current === 'loading' ? 'signedOut' : current))
+    }, 8_000)
+
+    const unsubscribe = onAuthStateChanged(auth, (next) => {
+      const runId = ++generation
+      void (async () => {
+        setError('')
+        if (!next) {
+          if (cancelled || runId !== generation) return
+          setUser(null)
+          setStatus('signedOut')
+          return
+        }
+        let allowed = false
+        try {
+          allowed = await isEmailAllowedAsync(next.email)
+        } catch (err) {
+          console.warn('초대 확인에 실패했습니다.', err)
+          // 확인 실패 시 로그인 화면에 머물게 해 재시도할 수 있게 한다.
+          if (cancelled || runId !== generation) return
+          setUser(null)
+          setStatus('signedOut')
+          setError('로그인 확인에 실패했습니다. 잠시 후 다시 시도해 주세요.')
+          try { await signOut(auth) } catch { /* ignore */ }
+          return
+        }
+        if (cancelled || runId !== generation) return
+        if (!allowed) {
+          setUser(null)
+          setStatus('denied')
+          setError(`${next.email ?? '이 계정'}은 초대되지 않은 사용자입니다.`)
+          try { await signOut(auth) } catch { /* ignore */ }
+          return
+        }
+        setUser(next)
+        setStatus('signedIn')
+      })()
     })
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(safetyTimer)
+      unsubscribe()
+    }
   }, [])
 
   const signInWithGoogle = useCallback(async () => {
@@ -67,15 +102,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       return
     }
     setError('')
+    setStatus('loading')
     try {
       const auth = getFirebaseAuth()
       const result = await signInWithPopup(auth, new GoogleAuthProvider())
-      if (!isEmailAllowed(result.user.email)) {
+      const allowed = await isEmailAllowedAsync(result.user.email)
+      if (!allowed) {
         setStatus('denied')
         setError(`${result.user.email ?? '이 계정'}은 초대되지 않은 사용자입니다.`)
         await signOut(auth)
         setUser(null)
+        return
       }
+      setUser(result.user)
+      setStatus('signedIn')
     } catch (err) {
       const message = err instanceof Error ? err.message : '로그인에 실패했습니다.'
       setError(message.includes('popup-closed') ? '로그인이 취소되었습니다.' : 'Google 로그인에 실패했습니다.')

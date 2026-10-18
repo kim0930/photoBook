@@ -13,15 +13,19 @@ async function isHeic(blob: Blob, name: string) {
   return brand.startsWith('ftyp') || /\.hei[cf]$/i.test(name)
 }
 
+export type PrintFailure = { id: string; name: string; reason: string }
+
 export type PreparedPrintUrls = {
   urls: Map<string, string>
   /** createObjectURL로 만든 값만 — selectedFrame 등은 revoke하지 않음 */
   owned: string[]
+  failed: PrintFailure[]
 }
 
 export async function preparePrintUrls(photos: Photo[], onProgress: (label: string) => void): Promise<PreparedPrintUrls> {
   const urls = new Map<string, string>()
   const owned: string[] = []
+  const failed: PrintFailure[] = []
   const heic: Photo[] = []
 
   for (const photo of photos) {
@@ -29,7 +33,11 @@ export async function preparePrintUrls(photos: Photo[], onProgress: (label: stri
       urls.set(photo.id, photo.selectedFrame)
       continue
     }
-    if (!photo.file?.size) continue
+    if (!photo.file?.size) {
+      if (photo.thumbUrl) urls.set(photo.id, photo.thumbUrl)
+      else failed.push({ id: photo.id, name: photo.name, reason: '원본 파일 없음' })
+      continue
+    }
     if (await isHeic(photo.file, photo.name)) heic.push(photo)
     else {
       const url = URL.createObjectURL(photo.file)
@@ -40,17 +48,20 @@ export async function preparePrintUrls(photos: Photo[], onProgress: (label: stri
 
   for (let index = 0; index < heic.length; index += 1) {
     onProgress(`원본 준비 ${index + 1}/${heic.length}`)
+    const photo = heic[index]
     try {
-      const rendered = await renderHeicDisplay(heic[index].file)
+      const rendered = await renderHeicDisplay(photo.file)
       const url = URL.createObjectURL(rendered.display)
-      urls.set(heic[index].id, url)
+      urls.set(photo.id, url)
       owned.push(url)
     } catch (error) {
-      console.warn(`${heic[index].name} 원본 변환을 건너뜁니다.`, error)
+      console.warn(`${photo.name} 원본 변환을 건너뜁니다.`, error)
+      if (photo.thumbUrl) urls.set(photo.id, photo.thumbUrl)
+      else failed.push({ id: photo.id, name: photo.name, reason: 'HEIC 변환 실패' })
     }
   }
 
-  return { urls, owned }
+  return { urls, owned, failed }
 }
 
 export function revokePrintUrls(urls: Iterable<string>) {
@@ -81,7 +92,7 @@ export async function exportBookPdf(
   orientation: 'portrait' | 'landscape',
   pageCount: number,
   onProgress: (current: number) => void,
-) {
+): Promise<{ pageErrors: string[] }> {
   if (!pageCount) throw new Error('내보낼 페이지가 없습니다.')
 
   const spread = coverSpread(size, orientation, pageCount)
@@ -112,13 +123,30 @@ export async function exportBookPdf(
   }
   if (jacket) await paint(jacket, spread.spreadMm, spread.heightMm, 'p')
 
+  const pageErrors: string[] = []
   for (let index = 0; index < pageCount; index += 1) {
     const node = document.querySelector<HTMLElement>(`[data-export-page="${index}"]`)
-    if (!node) throw new Error(`${index + 1}페이지를 렌더링할 수 없습니다.`)
-    await paint(node, spread.widthMm, spread.heightMm, orientation)
+    if (!node) {
+      pageErrors.push(`${index + 1}페이지를 찾지 못함`)
+      onProgress(index + 1)
+      continue
+    }
+    try {
+      await paint(node, spread.widthMm, spread.heightMm, orientation)
+    } catch (error) {
+      console.warn(`${index + 1}페이지 캡처 실패, 재시도`, error)
+      try {
+        await new Promise((resolve) => window.setTimeout(resolve, 200))
+        await paint(node, spread.widthMm, spread.heightMm, orientation)
+      } catch (retryError) {
+        console.warn(`${index + 1}페이지 캡처 최종 실패`, retryError)
+        pageErrors.push(`${index + 1}페이지`)
+      }
+    }
     onProgress(index + 1)
   }
 
   if (!placed) throw new Error('PDF에 넣을 페이지를 찾지 못했습니다.')
   pdf.save(`photobook-${new Date().getFullYear()}.pdf`)
+  return { pageErrors }
 }

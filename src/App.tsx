@@ -1,5 +1,5 @@
 import {
-  BookOpen, Check, ChevronLeft, ChevronRight, ChevronsLeft, Download, FolderOpen, Home, ImagePlus, LogOut, Pencil,
+  Archive, BookOpen, Check, ChevronLeft, ChevronRight, ChevronsLeft, Copy, Download, FolderOpen, Home, ImagePlus, LogOut, Pencil,
   Crop, Grip, LayoutTemplate, Lock, MapPinned, Maximize2, Minus, Mountain, Plus, RotateCcw, RotateCw, Settings2, Sparkles,
   Trash2, Upload, Users, WandSparkles, X,
 } from 'lucide-react'
@@ -11,19 +11,25 @@ import './App.css'
 import { useAuth } from './auth/AuthContext'
 import { buildChapters, cachedPlace, placeName } from './chapters/tripDetection'
 import { analyzePhoto } from './classify/analyzePhoto'
+import { CoverDecorPicker, PageDecorPicker } from './components/DecorPicker'
+import { FrameLayer } from './components/FrameLayer'
+import { InvitesPanel } from './components/InvitesPanel'
 import { LivePhotoPicker } from './components/LivePhotoPicker'
 import { MemoriesPanel } from './components/MemoriesPanel'
 import { TripMap } from './components/TripMap'
+import { EMPTY_FRAME } from './decorate/frames'
 import { groupFaces } from './curate/faces'
 import { scanDocuments } from './curate/ocr'
 import { SIGNALS_VERSION, curatePhotos, scoreQuality } from './curate/signals'
 import {
   attachPhotoBinaries, attachPhotoBinary, createBook, deleteBook, getActiveBookId, listBooks, loadBookWorkspace,
-  revokePhotoUrls, saveCurationSettings, savePageNotes, setActiveBookId, syncBookMetaFromPhotos, type BookListItem,
+  revokePhotoUrls, saveCurationSettings, savePageNotes, setActiveBookId, syncBookMetaFromPhotos, updateBookMeta,
+  type BookListItem,
 } from './db'
 import { STICKER_EMOJIS } from './stickers'
+import { duplicateBook, exportBookBackup, importBookBackup } from './export/backup'
 import { exportBookPdf, preparePrintUrls, revokePrintUrls, waitForExportImages } from './export/pdf'
-import { chooseDirectoryFiles, scanFiles } from './import/scanFolder'
+import { chooseDirectoryFiles, scanFiles, type ImportSkip } from './import/scanFolder'
 import { availableLayouts, computeAdaptiveLayout, findPhotoGutters, YEAR_CHAPTER_ID, type LayoutId, type PhotoGutter } from './layout/autoLayout'
 import { BOOK_SIZES, MAX_PAGES, coverSpread } from './settings/bookSize'
 import { EMPTY_COVER, useBookStore } from './store'
@@ -54,6 +60,7 @@ function App() {
   const setLibrary = useBookStore((state) => state.setLibrary)
   const [progress, setProgress] = useState<ImportProgress>()
   const [importError, setImportError] = useState('')
+  const [importSkips, setImportSkips] = useState<ImportSkip[]>([])
   const [livePhoto, setLivePhoto] = useState<Photo>()
   const [cropPhotoId, setCropPhotoId] = useState<string>()
   const [selectedCanvasPhotoId, setSelectedCanvasPhotoId] = useState<string>()
@@ -74,6 +81,8 @@ function App() {
   const [bookList, setBookList] = useState<BookListItem[]>([])
   const [openingBookId, setOpeningBookId] = useState<string>()
   const [deletingBookId, setDeletingBookId] = useState<string>()
+  const [shelfBusyId, setShelfBusyId] = useState<string>()
+  const [shelfStatus, setShelfStatus] = useState('')
   const [thumbSize, setThumbSize] = useState(() => storedNumber('photobook-thumb-size', DEFAULT_THUMB))
   const [templateSize, setTemplateSize] = useState(() => {
     const stored = storedNumber('photobook-template-size', DEFAULT_TEMPLATE)
@@ -82,6 +91,7 @@ function App() {
   const [trayWidth, setTrayWidth] = useState(() => storedNumber('photobook-tray-width', trayWidthForColumns(DEFAULT_THUMB)))
   const [coverMode, setCoverMode] = useState(false)
   const [drawMode, setDrawMode] = useState(false)
+  const [decorOpen, setDecorOpen] = useState(false)
   const [stickerPicker, setStickerPicker] = useState<'page' | CoverPanel | null>(null)
   const [penColor, setPenColor] = useState('#2b2824')
   const [penSize, setPenSize] = useState(1.2)
@@ -92,6 +102,7 @@ function App() {
   const [deleteConfirm, setDeleteConfirm] = useState<{ ids: string[]; title: string; body: string } | null>(null)
   const canvasRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
+  const backupInputRef = useRef<HTMLInputElement>(null)
   const addInputRef = useRef<HTMLInputElement>(null)
   const trayListRef = useRef<HTMLDivElement>(null)
   const pageListRef = useRef<HTMLDivElement>(null)
@@ -142,6 +153,7 @@ function App() {
       pageStickers: {},
       pageMaps: {},
       cover: EMPTY_COVER,
+      pageFrame: { ...EMPTY_FRAME },
       completedPages: {},
       faceGroups: [],
       curation: { faceGroupsEnabled: false, hiddenRanges: [], focusFaceIds: [] },
@@ -198,7 +210,17 @@ function App() {
         curation,
         faceGroups,
         completedPages,
-        ...(cover ? { cover: { ...EMPTY_COVER, ...cover, stickers: cover.stickers ?? [] } } : {}),
+        ...(cover ? {
+          cover: {
+            ...EMPTY_COVER,
+            ...cover,
+            stickers: cover.stickers ?? [],
+            frame: cover.frame ? { ...EMPTY_FRAME, ...cover.frame } : EMPTY_COVER.frame,
+          },
+        } : {}),
+        pageFrame: bookLayout?.pageFrame
+          ? { ...EMPTY_FRAME, ...bookLayout.pageFrame }
+          : { ...EMPTY_FRAME },
       })
       if (bookLayout?.pages?.length) {
         useBookStore.setState({
@@ -242,6 +264,7 @@ function App() {
     await refreshBookList()
     setShowWelcome(true)
     setCoverMode(false)
+    setDecorOpen(false)
     setTraySelected([])
     setTrayPreviewId(undefined)
   }
@@ -264,9 +287,78 @@ function App() {
     }
   }
 
+  async function renameBookOnShelf(book: BookListItem) {
+    const next = window.prompt('포토북 이름', book.title || book.periodLabel)
+    if (next == null) return
+    const title = next.trim()
+    if (!title || title === (book.title || book.periodLabel)) return
+    setShelfBusyId(book.id)
+    setShelfStatus('이름 바꾸는 중…')
+    try {
+      await updateBookMeta(book.id, { title })
+      await refreshBookList()
+      setShelfStatus('이름을 바꿨습니다.')
+    } catch (error) {
+      console.warn('이름 변경 실패', error)
+      setImportError('포토북 이름을 바꾸지 못했습니다.')
+    } finally {
+      setShelfBusyId(undefined)
+    }
+  }
+
+  async function backupBookOnShelf(bookId: string) {
+    setShelfBusyId(bookId)
+    setShelfStatus('백업 준비 중…')
+    try {
+      await exportBookBackup(bookId, setShelfStatus)
+      setShelfStatus('백업 파일을 저장했습니다.')
+    } catch (error) {
+      console.warn('백업 실패', error)
+      setImportError(error instanceof Error ? error.message : '백업에 실패했습니다.')
+      setShelfStatus('')
+    } finally {
+      setShelfBusyId(undefined)
+    }
+  }
+
+  async function duplicateBookOnShelf(bookId: string) {
+    setShelfBusyId(bookId)
+    setShelfStatus('복제 중…')
+    try {
+      await duplicateBook(bookId, setShelfStatus)
+      await refreshBookList()
+      setShelfStatus('복사본을 만들었습니다.')
+    } catch (error) {
+      console.warn('복제 실패', error)
+      setImportError(error instanceof Error ? error.message : '복제에 실패했습니다.')
+      setShelfStatus('')
+    } finally {
+      setShelfBusyId(undefined)
+    }
+  }
+
+  async function restoreBookBackup(file: File) {
+    setImportError('')
+    setShelfStatus('백업 복원 중…')
+    setShelfBusyId('restore')
+    try {
+      const bookId = await importBookBackup(file, setShelfStatus)
+      await refreshBookList()
+      setShelfStatus('복원이 완료되었습니다. 책을 열어보세요.')
+      await openBook(bookId)
+    } catch (error) {
+      console.warn('복원 실패', error)
+      setImportError(error instanceof Error ? error.message : '백업을 복원하지 못했습니다.')
+      setShelfStatus('')
+    } finally {
+      setShelfBusyId(undefined)
+    }
+  }
+
   async function startNewBook(files: File[]) {
     if (!files.length) return
     setImportError('')
+    setImportSkips([])
     let createdId: string | undefined
     try {
       const currentId = getActiveBookId()
@@ -336,6 +428,7 @@ function App() {
   async function importFiles(files: File[], replace = true) {
     if (!files.length) return
     setImportError('')
+    if (replace) setImportSkips([])
     try {
       if (replace && !getActiveBookId()) {
         await createBook({ year: CURRENT_YEAR, title: '새 포토북' })
@@ -344,12 +437,16 @@ function App() {
       const existing = replace ? [] : useBookStore.getState().photos
       const preferredYear = replace ? undefined : (existing.length ? bookYearFromPhotos(existing) : undefined)
       const scanned = await scanFiles(files, setProgress, { year: preferredYear })
-      if (!scanned.length) {
-        throw new Error(preferredYear
+      setImportSkips((previous) => (replace ? scanned.skips : [...previous, ...scanned.skips]))
+      if (!scanned.photos.length) {
+        const skipHint = scanned.skips.length
+          ? `\n건너뛴 파일 ${scanned.skips.length}개`
+          : ''
+        throw new Error((preferredYear
           ? `${preferredYear}년에 촬영한 사진을 찾지 못했습니다.`
-          : '가져올 사진을 찾지 못했습니다.')
+          : '가져올 사진을 찾지 못했습니다.') + skipHint)
       }
-      const curated = await curatePhotos([...existing, ...scanned], (current, total) => {
+      const curated = await curatePhotos([...existing, ...scanned.photos], (current, total) => {
         setProgress({ current, total, label: '사진을 고르는 중' })
       })
       if (replace) {
@@ -366,6 +463,9 @@ function App() {
       void scanDocuments(useBookStore.getState().photos, (id, text, document) => {
         useBookStore.getState().setPhotoText(id, text, document)
       })
+      if (scanned.skips.length) {
+        setImportError(`${scanned.photos.length}장을 가져왔고, ${scanned.skips.length}개는 건너뛰었습니다.`)
+      }
     } catch (error) {
       setImportError(error instanceof Error ? error.message : '사진을 가져오지 못했습니다.')
       throw error instanceof Error ? error : new Error('사진을 가져오지 못했습니다.')
@@ -605,6 +705,14 @@ function App() {
       const withFiles = await attachPhotoBinaries(useBookStore.getState().photos)
       const prepared = await preparePrintUrls(withFiles, setExportLabel)
       owned.push(...prepared.owned)
+      if (prepared.failed.length) {
+        const sample = prepared.failed.slice(0, 5).map((item) => `· ${item.name} (${item.reason})`).join('\n')
+        const extra = prepared.failed.length > 5 ? `\n외 ${prepared.failed.length - 5}장` : ''
+        const proceed = window.confirm(
+          `${prepared.failed.length}장 원본을 준비하지 못했습니다.\n${sample}${extra}\n\n가능한 페이지만 PDF로 만들까요?`,
+        )
+        if (!proceed) return
+      }
       flushSync(() => {
         setPrintUrls(Object.fromEntries(prepared.urls))
         setExportLabel('PDF 만드는 중')
@@ -612,7 +720,17 @@ function App() {
       await waitForExportImages()
       await new Promise((resolve) => window.setTimeout(resolve, 120))
       const { bookSize, orientation } = useBookStore.getState()
-      await exportBookPdf(bookSize, orientation, pages.length, (page) => setExportLabel(`${page}/${pages.length}`))
+      const { pageErrors } = await exportBookPdf(
+        bookSize,
+        orientation,
+        pages.length,
+        (page) => setExportLabel(`${page}/${pages.length}`),
+      )
+      if (pageErrors.length) {
+        window.alert(
+          `PDF를 저장했지만 ${pageErrors.length}페이지 캡처에 실패했습니다.\n${pageErrors.slice(0, 10).join('\n')}`,
+        )
+      }
     } catch (error) {
       console.warn('PDF 내보내기에 실패했습니다.', error)
       const message = error instanceof Error
@@ -738,11 +856,19 @@ function App() {
           <h1>사진은 그대로.<br /><em>추억은 한 권으로.</em></h1>
           <p className="lead">아이폰 사진 폴더를 선택하면 새 포토북이 만들어집니다.<br />이미 만든 책은 아래에서 이어서 편집할 수 있어요.</p>
           <div className="import-card">
-            <button className="import-button" onClick={() => void pickFolder()} disabled={Boolean(progress)}>
+            <button className="import-button" onClick={() => void pickFolder()} disabled={Boolean(progress) || Boolean(shelfBusyId)}>
               <FolderOpen /> 새 포토북 만들기
             </button>
-            <button className="text-button" onClick={() => inputRef.current?.click()} disabled={Boolean(progress)}>
+            <button className="text-button" onClick={() => inputRef.current?.click()} disabled={Boolean(progress) || Boolean(shelfBusyId)}>
               파일 또는 폴더로 새 포토북 만들기
+            </button>
+            <button
+              type="button"
+              className="text-button"
+              disabled={Boolean(progress) || Boolean(shelfBusyId)}
+              onClick={() => backupInputRef.current?.click()}
+            >
+              <Archive size={14} /> 백업에서 복원
             </button>
             <input
               ref={inputRef}
@@ -757,13 +883,42 @@ function App() {
                 void startNewBook(files)
               }}
             />
-            {progress && (
+            <input
+              ref={backupInputRef}
+              className="hidden-input"
+              type="file"
+              accept=".zip,application/zip"
+              onChange={(event) => {
+                const file = event.target.files?.[0]
+                event.target.value = ''
+                if (file) void restoreBookBackup(file)
+              }}
+            />
+            {(progress || shelfStatus) && (
               <div className="progress">
-                <div><span style={{ width: `${progress.total > 0 ? (progress.current / progress.total) * 100 : 100}%` }} /></div>
-                <small>{progress.total > 0 ? `${progress.label} · ${progress.current}/${progress.total}` : progress.label}</small>
+                <div><span style={{ width: `${progress && progress.total > 0 ? (progress.current / progress.total) * 100 : 100}%` }} /></div>
+                <small>
+                  {progress
+                    ? (progress.total > 0 ? `${progress.label} · ${progress.current}/${progress.total}` : progress.label)
+                    : shelfStatus}
+                </small>
               </div>
             )}
             {importError && <p className="error">{importError}</p>}
+            {importSkips.length > 0 && (
+              <details className="skip-report">
+                <summary>건너뛴 파일 {importSkips.length}개</summary>
+                <ul>
+                  {importSkips.slice(0, 40).map((skip, index) => (
+                    <li key={`${skip.name}-${index}`}>
+                      <span>{skip.name}</span>
+                      <small>{skip.reason}</small>
+                    </li>
+                  ))}
+                  {importSkips.length > 40 && <li><small>외 {importSkips.length - 40}개</small></li>}
+                </ul>
+              </details>
+            )}
           </div>
           {bookList.length > 0 && (
             <section className="book-shelf" aria-label="포토북 목록">
@@ -773,13 +928,13 @@ function App() {
               </header>
               <ul className="book-shelf-list">
                 {bookList.map((book) => {
-                  const busy = openingBookId === book.id || deletingBookId === book.id
+                  const busy = openingBookId === book.id || deletingBookId === book.id || shelfBusyId === book.id
                   return (
                     <li key={book.id} className="book-card">
                       <button
                         type="button"
                         className="book-card-main"
-                        disabled={busy || Boolean(progress)}
+                        disabled={busy || Boolean(progress) || Boolean(shelfBusyId)}
                         onClick={() => void openBook(book.id)}
                       >
                         <span className="book-card-cover">
@@ -792,28 +947,40 @@ function App() {
                           <small>{book.photoCount}장</small>
                           <small>{new Date(book.updatedAt).toLocaleDateString('ko-KR')}</small>
                           {openingBookId === book.id && <em>여는 중…</em>}
+                          {shelfBusyId === book.id && shelfStatus && <em>{shelfStatus}</em>}
                         </span>
                       </button>
-                      <button
-                        type="button"
-                        className="book-card-delete"
-                        aria-label={`${book.title} 삭제`}
-                        title="포토북 삭제"
-                        disabled={busy || Boolean(progress)}
-                        onClick={() => {
-                          if (window.confirm(`「${book.title || book.periodLabel}」포토북을 삭제할까요?\n사진 원본 파일은 기기에 그대로 남습니다.`)) {
-                            void removeBookFromList(book.id)
-                          }
-                        }}
-                      >
-                        <Trash2 />
-                      </button>
+                      <div className="book-card-actions">
+                        <button type="button" title="이름 변경" aria-label="이름 변경" disabled={busy || Boolean(progress) || Boolean(shelfBusyId)} onClick={() => void renameBookOnShelf(book)}>
+                          <Pencil />
+                        </button>
+                        <button type="button" title="백업" aria-label="백업" disabled={busy || Boolean(progress) || Boolean(shelfBusyId)} onClick={() => void backupBookOnShelf(book.id)}>
+                          <Archive />
+                        </button>
+                        <button type="button" title="복제" aria-label="복제" disabled={busy || Boolean(progress) || Boolean(shelfBusyId)} onClick={() => void duplicateBookOnShelf(book.id)}>
+                          <Copy />
+                        </button>
+                        <button
+                          type="button"
+                          title="삭제"
+                          aria-label={`${book.title} 삭제`}
+                          disabled={busy || Boolean(progress) || Boolean(shelfBusyId)}
+                          onClick={() => {
+                            if (window.confirm(`「${book.title || book.periodLabel}」포토북을 삭제할까요?\n사진 원본 파일은 기기에 그대로 남습니다.`)) {
+                              void removeBookFromList(book.id)
+                            }
+                          }}
+                        >
+                          <Trash2 />
+                        </button>
+                      </div>
                     </li>
                   )
                 })}
               </ul>
             </section>
           )}
+          <InvitesPanel />
           <aside className="iphone-tip">
             <strong>아이폰 연결 전 확인</strong>
             설정 → 사진 → Mac 또는 PC로 전송에서 <b>원본 유지</b>를 선택하면 실시간 사진도 가져올 수 있어요.
@@ -862,28 +1029,52 @@ function App() {
         if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') store.undo()
       }}
     >
-      <header className="topbar">
-        <div className="brand"><BookOpen /><span>Year in Frames</span><i title={bookPeriod}>{bookPeriod || bookYear}</i></div>
-        <button className="top-add-photo" onClick={() => addInputRef.current?.click()}><ImagePlus /> 사진 추가</button>
-        <input ref={addInputRef} className="hidden-input" type="file" multiple accept="image/*,.heic,.heif" onChange={(e) => void importFiles(Array.from(e.target.files ?? []), false)} />
-        <div className="top-actions">
-          {user?.email && <span className="auth-user-label" title={user.email}>{user.email}</span>}
-          <button className="ghost-button" onClick={() => void signOutUser()} title="로그아웃"><LogOut /> 로그아웃</button>
-          <button className="ghost-button" onClick={() => void goHome()}><Home /> 첫 화면</button>
-          <button className="ghost-button" onClick={store.undo}><RotateCcw /> 되돌리기</button>
-          <button className="smart-layout-button" onClick={() => void createSmartLayout()} disabled={Boolean(analysisProgress)}>
-            <WandSparkles /> {analysisProgress ? `사진 분석 ${analysisProgress}%` : '스마트 배치'}
-          </button>
-          <button className="ghost-button" onClick={() => setSettingsOpen(true)}><Settings2 /> 책 설정</button>
-          <button
-            className="primary-button"
-            onClick={() => void exportPdf()}
-            disabled={Boolean(exportLabel)}
-          >
-            <Download /> {exportLabel || 'PDF 내보내기'}
-          </button>
-        </div>
-      </header>
+      <div className="app-chrome">
+        <header className="topbar">
+          <div className="brand"><BookOpen /><span>Year in Frames</span><i title={bookPeriod}>{bookPeriod || bookYear}</i></div>
+          <button className="top-add-photo" onClick={() => addInputRef.current?.click()}><ImagePlus /> 사진 추가</button>
+          <input ref={addInputRef} className="hidden-input" type="file" multiple accept="image/*,.heic,.heif" onChange={(e) => void importFiles(Array.from(e.target.files ?? []), false)} />
+          <div className="top-actions">
+            {user?.email && <span className="auth-user-label" title={user.email}>{user.email}</span>}
+            <button className="ghost-button" onClick={() => void signOutUser()} title="로그아웃"><LogOut /> 로그아웃</button>
+            <button className="ghost-button" onClick={() => void goHome()}><Home /> 첫 화면</button>
+            <button className="ghost-button" onClick={store.undo}><RotateCcw /> 되돌리기</button>
+            <button className="smart-layout-button" onClick={() => void createSmartLayout()} disabled={Boolean(analysisProgress)}>
+              <WandSparkles /> {analysisProgress ? `사진 분석 ${analysisProgress}%` : '스마트 배치'}
+            </button>
+            <button className="ghost-button" onClick={() => setSettingsOpen(true)}><Settings2 /> 책 설정</button>
+            <button
+              className="primary-button"
+              onClick={() => void exportPdf()}
+              disabled={Boolean(exportLabel)}
+            >
+              <Download /> {exportLabel || 'PDF 내보내기'}
+            </button>
+          </div>
+        </header>
+        {(importError || importSkips.length > 0 || progress) && (
+          <div className="import-banner" role="status">
+            {progress && (
+              <span>{progress.total > 0 ? `${progress.label} · ${progress.current}/${progress.total}` : progress.label}</span>
+            )}
+            {!progress && importError && <span>{importError}</span>}
+            {importSkips.length > 0 && (
+              <details className="skip-report inline">
+                <summary>건너뛴 파일 {importSkips.length}개</summary>
+                <ul>
+                  {importSkips.slice(0, 20).map((skip, index) => (
+                    <li key={`${skip.name}-${index}`}>
+                      <span>{skip.name}</span>
+                      <small>{skip.reason}</small>
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            )}
+            <button type="button" className="text-button" onClick={() => { setImportError(''); setImportSkips([]) }}>닫기</button>
+          </div>
+        )}
+      </div>
 
       <aside className="page-sidebar">
         <div className="sidebar-heading">
@@ -987,7 +1178,9 @@ function App() {
               {coverMode ? (
                 <CoverBar
                   stickerPanel={stickerPicker && stickerPicker !== 'page' ? stickerPicker : null}
-                  onStickerPanel={(panel) => setStickerPicker(panel)}
+                  onStickerPanel={(panel) => { setStickerPicker(panel); setDecorOpen(false) }}
+                  decorOpen={decorOpen}
+                  onDecorOpen={(open) => { setDecorOpen(open); if (open) setStickerPicker(null) }}
                 />
               ) : (
                 <>
@@ -1003,13 +1196,20 @@ function App() {
                   {!pageCompleted && (
                     <div className="note-toolbar">
                       <button type="button" onClick={() => store.addPageNote(selectedPage.id)}>메모</button>
-                      <button type="button" className={drawMode ? 'active' : ''} onClick={() => { setDrawMode((on) => !on); setStickerPicker(null) }}><Pencil /> 그리기</button>
+                      <button type="button" className={drawMode ? 'active' : ''} onClick={() => { setDrawMode((on) => !on); setStickerPicker(null); setDecorOpen(false) }}><Pencil /> 그리기</button>
                       <button
                         type="button"
                         className={stickerPicker === 'page' ? 'active' : ''}
-                        onClick={() => { setStickerPicker((open) => (open === 'page' ? null : 'page')); setDrawMode(false) }}
+                        onClick={() => { setStickerPicker((open) => (open === 'page' ? null : 'page')); setDrawMode(false); setDecorOpen(false) }}
                       >
                         스티커
+                      </button>
+                      <button
+                        type="button"
+                        className={decorOpen ? 'active' : ''}
+                        onClick={() => { setDecorOpen((open) => !open); setDrawMode(false); setStickerPicker(null) }}
+                      >
+                        테두리
                       </button>
                       <button
                         type="button"
@@ -1038,6 +1238,13 @@ function App() {
                         setStickerPicker(null)
                       }}
                       onClose={() => setStickerPicker(null)}
+                    />
+                  )}
+                  {!pageCompleted && decorOpen && (
+                    <PageDecorPicker
+                      frame={store.pageFrame}
+                      onChange={(next) => useBookStore.getState().setPageFrame(next)}
+                      onClose={() => setDecorOpen(false)}
                     />
                   )}
                   <span>페이지 {selectedIndex + 1}</span>
@@ -1914,6 +2121,7 @@ function PagePaper({ page, chapter, editable = false, drawing = false, penColor 
     updatePageMap: state.updatePageMap,
     removePageMap: state.removePageMap,
   })))
+  const pageFrame = useBookStore((state) => state.pageFrame)
   const gridRef = useRef<HTMLDivElement>(null)
   const [measuredRects, setMeasuredRects] = useState<Record<string, PhotoFrame>>({})
   const measureKey = page.type === 'photos' ? `${page.layoutId ?? ''}|${page.photoIds.join(',')}` : ''
@@ -1980,6 +2188,7 @@ function PagePaper({ page, chapter, editable = false, drawing = false, penColor 
         <PageStickersLayer pageId={page.id} stickers={pageStickers[page.id] ?? []} editable={editable} update={updatePageSticker} remove={removePageSticker} />
         <PageDrawing pageId={page.id} active={Boolean(editable && drawing)} color={penColor} size={penSize} ratio={ratio} />
         <PageFooter pageId={page.id} photos={items} chapter={chapter} pageNumber={pageNumber} placeRevision={placeRevision} editable={editable} caption={pageCaptions[page.id]} updatePageCaption={updatePageCaption} />
+        <FrameLayer frame={pageFrame} />
       </article>
     )
   }
@@ -2001,6 +2210,7 @@ function PagePaper({ page, chapter, editable = false, drawing = false, penColor 
         <PageStickersLayer pageId={page.id} stickers={pageStickers[page.id] ?? []} editable={editable} update={updatePageSticker} remove={removePageSticker} />
         <PageDrawing pageId={page.id} active={Boolean(editable && drawing)} color={penColor} size={penSize} ratio={ratio} />
         <PageFooter pageId={page.id} photos={items} chapter={chapter} pageNumber={pageNumber} placeRevision={placeRevision} editable={editable} caption={pageCaptions[page.id]} updatePageCaption={updatePageCaption} />
+        <FrameLayer frame={pageFrame} />
       </article>
     )
   }
@@ -2026,6 +2236,7 @@ function PagePaper({ page, chapter, editable = false, drawing = false, penColor 
         <PageMapLayer pageId={page.id} widget={pageMaps[page.id]} photos={chapterPhotos.length ? chapterPhotos : items} editable={editable} forExport={exportIndex !== undefined} update={updatePageMap} remove={removePageMap} />
         <PageDrawing pageId={page.id} active={Boolean(editable && drawing)} color={penColor} size={penSize} ratio={ratio} />
         <PageFooter pageId={page.id} photos={chapterPhotos.length ? chapterPhotos : items} chapter={chapter} pageNumber={pageNumber} placeRevision={placeRevision} editable={editable} caption={pageCaptions[page.id]} updatePageCaption={updatePageCaption} />
+        <FrameLayer frame={pageFrame} />
       </article>
     )
   }
@@ -2038,6 +2249,7 @@ function PagePaper({ page, chapter, editable = false, drawing = false, penColor 
         <PageStickersLayer pageId={page.id} stickers={pageStickers[page.id] ?? []} editable={editable} update={updatePageSticker} remove={removePageSticker} />
         <PageDrawing pageId={page.id} active={Boolean(editable && drawing)} color={penColor} size={penSize} ratio={ratio} />
         <PageFooter pageId={page.id} photos={chapterPhotos} chapter={chapter} pageNumber={pageNumber} placeRevision={placeRevision} editable={editable} caption={pageCaptions[page.id]} updatePageCaption={updatePageCaption} />
+        <FrameLayer frame={pageFrame} />
       </article>
     )
   }
@@ -2225,6 +2437,7 @@ function PagePaper({ page, chapter, editable = false, drawing = false, penColor 
       <PageMapLayer pageId={page.id} widget={pageMaps[page.id]} photos={items} editable={editable} forExport={exportIndex !== undefined} update={updatePageMap} remove={removePageMap} />
       <PageDrawing pageId={page.id} active={Boolean(editable && drawing)} color={penColor} size={penSize} ratio={ratio} />
       <PageFooter pageId={page.id} photos={items} chapter={chapter} pageNumber={pageNumber} placeRevision={placeRevision} editable={editable} caption={pageCaptions[page.id]} updatePageCaption={updatePageCaption} />
+      <FrameLayer frame={pageFrame} />
     </article>
   )
 }
@@ -2854,7 +3067,17 @@ function MiniJacket({ year }: { year: number }) {
   )
 }
 
-function CoverBar({ stickerPanel, onStickerPanel }: { stickerPanel: CoverPanel | null; onStickerPanel: (panel: CoverPanel | null) => void }) {
+function CoverBar({
+  stickerPanel,
+  onStickerPanel,
+  decorOpen,
+  onDecorOpen,
+}: {
+  stickerPanel: CoverPanel | null
+  onStickerPanel: (panel: CoverPanel | null) => void
+  decorOpen: boolean
+  onDecorOpen: (open: boolean) => void
+}) {
   const { photos, cover, updateCover, addCoverSticker } = useBookStore()
   return (
     <div className="cover-fields">
@@ -2876,8 +3099,8 @@ function CoverBar({ stickerPanel, onStickerPanel }: { stickerPanel: CoverPanel |
           {photos.map((photo) => <option key={photo.id} value={photo.id}>{photo.name}</option>)}
         </select>
       </label>
-      <label className="note-swatch">배경<input type="color" aria-label="표지 배경" value={cover.backgroundColor} onChange={(event) => updateCover({ backgroundColor: event.target.value })} /></label>
-      <label className="note-swatch">글자<input type="color" aria-label="표지 글자" value={cover.textColor} onChange={(event) => updateCover({ textColor: event.target.value })} /></label>
+      <label className="note-swatch">배경<input type="color" aria-label="표지 배경" value={cover.backgroundColor} onChange={(event) => updateCover({ backgroundColor: event.target.value, themeId: 'custom' })} /></label>
+      <label className="note-swatch">글자<input type="color" aria-label="표지 글자" value={cover.textColor} onChange={(event) => updateCover({ textColor: event.target.value, themeId: 'custom' })} /></label>
       <label className="note-opacity">제목
         <input
           type="range"
@@ -2899,6 +3122,13 @@ function CoverBar({ stickerPanel, onStickerPanel }: { stickerPanel: CoverPanel |
         />
       </label>
       <div className="cover-sticker-tools">
+        <button
+          type="button"
+          className={decorOpen ? 'active' : ''}
+          onClick={() => onDecorOpen(!decorOpen)}
+        >
+          표지 꾸미기
+        </button>
         {(['front', 'spine', 'back'] as CoverPanel[]).map((panel) => (
           <button
             key={panel}
@@ -2910,6 +3140,13 @@ function CoverBar({ stickerPanel, onStickerPanel }: { stickerPanel: CoverPanel |
           </button>
         ))}
       </div>
+      {decorOpen && (
+        <CoverDecorPicker
+          cover={cover}
+          onCoverChange={updateCover}
+          onClose={() => onDecorOpen(false)}
+        />
+      )}
       {stickerPanel && (
         <StickerPicker
           onPick={(emoji) => {
@@ -2964,6 +3201,7 @@ function BookJacket({ year, editable = false, printUrls, printing = false }: {
           ) : cover.backText && <p>{cover.backText}</p>}
         </div>
         <CoverStickersLayer panel="back" stickers={stickers} editable={editable} update={updateCoverSticker} remove={removeCoverSticker} />
+        <FrameLayer frame={cover.frame} variant="cover" />
       </section>
       <section
         className="jacket-panel jacket-spine"
@@ -2979,6 +3217,7 @@ function BookJacket({ year, editable = false, printUrls, printing = false }: {
           <input aria-label="책등" value={cover.spineText} placeholder={cover.title || `${year}`} onChange={(event) => updateCover({ spineText: event.target.value })} />
         ) : <b>{cover.spineText || cover.title || year}</b>}
         <CoverStickersLayer panel="spine" stickers={stickers} editable={editable} update={updateCoverSticker} remove={removeCoverSticker} />
+        <FrameLayer frame={cover.frame} variant="cover" />
       </section>
       <section
         className="jacket-panel jacket-front"
@@ -3005,6 +3244,7 @@ function BookJacket({ year, editable = false, printUrls, printing = false }: {
           )}
         </div>
         <CoverStickersLayer panel="front" stickers={stickers} editable={editable} update={updateCoverSticker} remove={removeCoverSticker} />
+        <FrameLayer frame={cover.frame} variant="cover" />
       </section>
     </article>
   )

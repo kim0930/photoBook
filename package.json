@@ -23,6 +23,7 @@
     "firebase": "^13.0.0",
     "html-to-image": "^1.11.13",
     "jspdf": "^4.2.1",
+    "jszip": "^3.10.2",
     "leaflet": "^1.9.4",
     "libheif-js": "^1.19.8",
     "lucide-react": "^1.52.0",
@@ -34,6 +35,7 @@
     "zustand": "^5.0.15"
   },
   "devDependencies": {
+    "@types/jszip": "^3.4.0",
     "@types/leaflet": "^1.9.22",
     "@types/node": "^24.13.3",
     "@types/react": "^19.2.18",

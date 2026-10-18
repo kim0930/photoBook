@@ -179,6 +179,32 @@ export interface CoverSticker {
   rotation?: number
 }
 
+export type FrameTemplateId =
+  | 'none'
+  | 'thin'
+  | 'double'
+  | 'mat'
+  | 'gold-line'
+  | 'polaroid'
+  | 'film'
+  | 'corner-flourish'
+  | 'dashed'
+  | 'ribbon'
+  | 'custom'
+
+/** 페이지·표지 공통 테두리/장식 */
+export interface DecorFrame {
+  templateId: FrameTemplateId
+  color: string
+  accentColor?: string
+  /** 상대 굵기 (대략 0.6–3) */
+  weight: number
+  /** 가장자리에서 안쪽으로 (%) */
+  inset: number
+  /** 직접 넣은 장식 이미지 (투명 PNG 권장) */
+  customImageDataUrl?: string
+}
+
 export interface BookCoverDesign {
   title: string
   subtitle: string
@@ -192,6 +218,9 @@ export interface BookCoverDesign {
   titleSize?: number
   subtitleSize?: number
   stickers?: CoverSticker[]
+  /** 표지 색/테두리 테마 id */
+  themeId?: string
+  frame?: DecorFrame
 }
 
 export interface BookSize {

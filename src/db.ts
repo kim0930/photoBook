@@ -1,5 +1,5 @@
 import Dexie, { type EntityTable } from 'dexie'
-import type { BookCoverDesign, BookPage, Chapter, CurationSettings, DrawStroke, FaceGroup, FlowAspect, PageCaption, PageMapWidget, PageNote, PageSticker, Photo } from './types'
+import type { BookCoverDesign, BookPage, Chapter, CurationSettings, DecorFrame, DrawStroke, FaceGroup, FlowAspect, PageCaption, PageMapWidget, PageNote, PageSticker, Photo } from './types'
 
 type StoredPhoto = Omit<Photo, 'url' | 'thumbUrl' | 'file' | 'movie'> & { thumbnail: Blob; bookId: string }
 type StoredPhotoFile = { id: string; file: Blob; movie?: Blob }
@@ -34,6 +34,7 @@ export interface BookLayoutSnapshot {
   flowAspectModes: Record<string, FlowAspect>
   layoutRevision: number
   selectedPageId?: string
+  pageFrame?: DecorFrame
 }
 
 type StoredBookLayout = BookLayoutSnapshot & { id: string }

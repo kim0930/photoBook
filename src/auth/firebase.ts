@@ -1,5 +1,6 @@
 import { initializeApp, type FirebaseApp } from 'firebase/app'
 import { getAuth, type Auth } from 'firebase/auth'
+import { getFirestore, type Firestore } from 'firebase/firestore'
 
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY as string | undefined,
@@ -21,8 +22,9 @@ export function isFirebaseConfigured() {
 
 let app: FirebaseApp | undefined
 let auth: Auth | undefined
+let firestore: Firestore | undefined
 
-export function getFirebaseAuth() {
+function getFirebaseApp() {
   if (!isFirebaseConfigured()) {
     throw new Error('Firebase 환경 변수가 설정되지 않았습니다.')
   }
@@ -35,9 +37,18 @@ export function getFirebaseAuth() {
       messagingSenderId: firebaseConfig.messagingSenderId,
       storageBucket: firebaseConfig.storageBucket,
     })
-    auth = getAuth(app)
   }
-  return auth!
+  return app
+}
+
+export function getFirebaseAuth() {
+  if (!auth) auth = getAuth(getFirebaseApp())
+  return auth
+}
+
+export function getFirebaseFirestore() {
+  if (!firestore) firestore = getFirestore(getFirebaseApp())
+  return firestore
 }
 
 export function parseAllowedEmails(raw = import.meta.env.VITE_ALLOWED_EMAILS as string | undefined) {

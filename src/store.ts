@@ -3,8 +3,9 @@ import { selectForBook, type BookFilter } from './curate/bookSelection'
 import { ensureMonthChapters } from './chapters/tripDetection'
 import { clearBookLayout, db, deletePhotoBinary, getActiveBookId, persistCuration, saveBookLayout, saveCover, saveCurationSettings, saveDrawings, saveFaceGroups, savePageCaption, savePageCompleted, savePageMap, savePageNotes, savePageStickers, syncBookMetaFromPhotos, syncChapters } from './db'
 import { avoidObstacles, buildPages, computeAdaptiveLayout, ensureYearFrontPages, makeYearChapter, YEAR_CHAPTER_ID, type LayoutId } from './layout/autoLayout'
+import { EMPTY_FRAME } from './decorate/frames'
 import { BOOK_SIZES, MAX_PAGES } from './settings/bookSize'
-import type { BookCoverDesign, BookPage, BookSize, Chapter, CoverSticker, CurationSettings, DrawStroke, FaceGroup, FlowAspect, PageCaption, PageMapWidget, PageNote, PageSticker, Photo, PhotoAnalysis, PhotoCrop, PhotoFrame, PhotoSize } from './types'
+import type { BookCoverDesign, BookPage, BookSize, Chapter, CoverSticker, CurationSettings, DecorFrame, DrawStroke, FaceGroup, FlowAspect, PageCaption, PageMapWidget, PageNote, PageSticker, Photo, PhotoAnalysis, PhotoCrop, PhotoFrame, PhotoSize } from './types'
 
 const cropSaveTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const noteSaveTimers = new Map<string, ReturnType<typeof setTimeout>>()
@@ -31,6 +32,8 @@ export const EMPTY_COVER: BookCoverDesign = {
   titleSize: 42,
   subtitleSize: 16,
   stickers: [],
+  themeId: 'midnight',
+  frame: { ...EMPTY_FRAME, templateId: 'thin', color: '#f6f1e8', weight: 1, inset: 3 },
 }
 
 interface Snapshot {
@@ -51,6 +54,7 @@ interface BookState {
   pageStickers: Record<string, PageSticker[]>
   pageMaps: Record<string, PageMapWidget>
   cover: BookCoverDesign
+  pageFrame: DecorFrame
   selectedPageId?: string
   bookSize: BookSize
   orientation: 'portrait' | 'landscape'
@@ -74,7 +78,9 @@ interface BookState {
     flowAspectModes: Record<string, FlowAspect>
     layoutRevision: number
     selectedPageId?: string
+    pageFrame?: DecorFrame
   }) => void
+  setPageFrame: (frame: DecorFrame) => void
   includePhotos: (ids: string[]) => void
   hideDateRange: (start: string, end: string) => void
   removeHiddenRange: (id: string) => void
@@ -202,6 +208,7 @@ export const useBookStore = create<BookState>((set, get) => ({
   pageStickers: {},
   pageMaps: {},
   cover: EMPTY_COVER,
+  pageFrame: { ...EMPTY_FRAME },
   bookSize: BOOK_SIZES[0],
   orientation: 'portrait',
   marginMm: 8,
@@ -221,7 +228,16 @@ export const useBookStore = create<BookState>((set, get) => ({
     void clearBookLayout()
     const bookId = getActiveBookId()
     if (bookId) void syncBookMetaFromPhotos(bookId, laid.photos)
-    set({ ...laid, selectedPageId: laid.pages[0]?.id, history: [], layoutRevision: 0, layoutOverrides: {}, flowAspectModes: {}, completedPages: {} })
+    set({
+      ...laid,
+      selectedPageId: laid.pages[0]?.id,
+      history: [],
+      layoutRevision: 0,
+      layoutOverrides: {},
+      flowAspectModes: {},
+      completedPages: {},
+      pageFrame: { ...EMPTY_FRAME },
+    })
   },
   restoreBookLayout: (snapshot) =>
     set((state) => {
@@ -253,9 +269,11 @@ export const useBookStore = create<BookState>((set, get) => ({
         flowAspectModes: snapshot.flowAspectModes,
         layoutRevision: snapshot.layoutRevision,
         selectedPageId,
+        pageFrame: snapshot.pageFrame ? { ...EMPTY_FRAME, ...snapshot.pageFrame } : state.pageFrame,
         history: [],
       }
     }),
+  setPageFrame: (frame) => set({ pageFrame: frame }),
   setPageCompleted: (pageId, completed) =>
     set((state) => {
       if (!state.pages.some((page) => page.id === pageId)) return state
@@ -1198,6 +1216,7 @@ useBookStore.subscribe((state, previous) => {
     && state.flowAspectModes === previous.flowAspectModes
     && state.layoutRevision === previous.layoutRevision
     && state.selectedPageId === previous.selectedPageId
+    && state.pageFrame === previous.pageFrame
   ) return
   if (bookLayoutSaveTimer) clearTimeout(bookLayoutSaveTimer)
   if (!state.pages.length) {
@@ -1213,6 +1232,7 @@ useBookStore.subscribe((state, previous) => {
       flowAspectModes: state.flowAspectModes,
       layoutRevision: state.layoutRevision,
       selectedPageId: state.selectedPageId,
+      pageFrame: state.pageFrame,
     }, bookId)
     void syncBookMetaFromPhotos(bookId, state.photos)
   }, 280)

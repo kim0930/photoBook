@@ -121,12 +121,15 @@ function dominantYear(dates: Date[]) {
   return [...counts.entries()].sort((a, b) => b[1] - a[1] || b[0] - a[0])[0][0]
 }
 
+export type ImportSkip = { name: string; reason: string }
+export type ScanResult = { photos: Photo[]; skips: ImportSkip[]; year?: number }
+
 /** year를 주면 그해만, 없으면 폴더에서 가장 많은 촬영 연도를 골라 가져온다. */
 export async function scanFiles(
   files: File[],
   onProgress: (progress: ImportProgress) => void,
   options?: { year?: number },
-): Promise<Photo[]> {
+): Promise<ScanResult> {
   const images = files.filter((file) => IMAGE_EXTENSIONS.test(file.name))
   const movies = new Map(
     files
@@ -134,7 +137,15 @@ export async function scanFiles(
       .map((file) => [baseName(file.name), file]),
   )
   const photos: Photo[] = []
-  if (!images.length) return photos
+  const skips: ImportSkip[] = []
+  if (!images.length) {
+    for (const file of files) {
+      if (!IMAGE_EXTENSIONS.test(file.name) && !MOVIE_EXTENSIONS.test(file.name)) {
+        skips.push({ name: file.name, reason: '지원하지 않는 형식' })
+      }
+    }
+    return { photos, skips }
+  }
 
   onProgress({ current: 0, total: images.length, label: '촬영 연도를 확인하는 중' })
   const dated: Array<{ file: File; capturedAt: Date }> = []
@@ -142,14 +153,20 @@ export async function scanFiles(
   await mapLimit(images, Math.min(8, IMPORT_CONCURRENCY * 2), async (file) => {
     const capturedAt = await readCaptureDate(file)
     if (capturedAt) dated.push({ file, capturedAt })
+    else skips.push({ name: file.name, reason: '촬영일을 읽지 못함' })
     datedDone += 1
     onProgress({ current: datedDone, total: images.length, label: '촬영 연도를 확인하는 중' })
   })
 
   const year = options?.year ?? dominantYear(dated.map((item) => item.capturedAt))
-  if (year == null) return photos
+  if (year == null) return { photos, skips, year }
   const targets = dated.filter((item) => item.capturedAt.getFullYear() === year).map((item) => item.file)
-  if (!targets.length) return photos
+  for (const item of dated) {
+    if (item.capturedAt.getFullYear() !== year) {
+      skips.push({ name: item.file.name, reason: `${year}년이 아님 (${item.capturedAt.getFullYear()}년)` })
+    }
+  }
+  if (!targets.length) return { photos, skips, year }
 
   let finished = 0
   onProgress({ current: 0, total: targets.length, label: `${year}년 사진을 준비하는 중` })
@@ -218,6 +235,8 @@ export async function scanFiles(
       photos.push(photo)
       await persistPhoto(photo, thumbnail, file)
     } catch (error) {
+      const reason = error instanceof Error ? error.message : '처리 실패'
+      skips.push({ name: file.name, reason })
       console.warn(`${file.name} 파일을 건너뜁니다.`, error)
     } finally {
       finished += 1
@@ -225,7 +244,11 @@ export async function scanFiles(
     }
   })
 
-  return photos.sort((a, b) => a.capturedAt.localeCompare(b.capturedAt))
+  return {
+    photos: photos.sort((a, b) => a.capturedAt.localeCompare(b.capturedAt)),
+    skips,
+    year,
+  }
 }
 
 export async function chooseDirectoryFiles(onCount?: (count: number) => void): Promise<File[]> {
