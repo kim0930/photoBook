@@ -318,11 +318,24 @@ export async function deleteBook(bookId: string) {
 }
 
 export async function persistPhoto(photo: Photo, thumbnail: Blob, displayBlob: Blob = photo.file) {
+  await persistPhotosBulk([{ photo, thumbnail, displayBlob }])
+}
+
+export async function persistPhotosBulk(
+  entries: Array<{ photo: Photo; thumbnail: Blob; displayBlob?: Blob }>,
+) {
+  if (!entries.length) return
   const bookId = requireBookId()
-  const { url: _url, thumbUrl: _thumbUrl, file: _file, movie, ...meta } = photo
   await db.transaction('rw', db.photos, db.photoFiles, async () => {
-    await db.photos.put({ ...meta, thumbnail, bookId })
-    await db.photoFiles.put({ id: photo.id, file: displayBlob, movie })
+    await db.photos.bulkPut(entries.map(({ photo, thumbnail }) => {
+      const { url: _url, thumbUrl: _thumbUrl, file: _file, movie: _movie, ...meta } = photo
+      return { ...meta, thumbnail, bookId }
+    }))
+    await db.photoFiles.bulkPut(entries.map(({ photo, displayBlob }) => ({
+      id: photo.id,
+      file: displayBlob ?? photo.file,
+      movie: photo.movie,
+    })))
   })
 }
 
