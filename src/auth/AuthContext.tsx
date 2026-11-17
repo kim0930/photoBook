@@ -23,20 +23,31 @@ interface AuthContextValue {
   status: AuthStatus
   user: User | null
   error: string
+  /** 로컬 개발에서는 로그인 없이 바로 들어온다. */
+  skipAuth: boolean
   signInWithGoogle: () => Promise<void>
   signOutUser: () => Promise<void>
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null)
 
+/** Vite dev 서버(로컬)에서는 Google 로그인을 건너뛴다. */
+export const SKIP_AUTH_LOCALLY = import.meta.env.DEV
+
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [status, setStatus] = useState<AuthStatus>(() => (
-    isFirebaseConfigured() ? 'loading' : 'misconfigured'
-  ))
+  const [status, setStatus] = useState<AuthStatus>(() => {
+    if (SKIP_AUTH_LOCALLY) return 'signedIn'
+    return isFirebaseConfigured() ? 'loading' : 'misconfigured'
+  })
   const [user, setUser] = useState<User | null>(null)
   const [error, setError] = useState('')
 
   useEffect(() => {
+    if (SKIP_AUTH_LOCALLY) {
+      setStatus('signedIn')
+      setUser(null)
+      return
+    }
     if (!isFirebaseConfigured()) {
       setStatus('misconfigured')
       return
@@ -67,7 +78,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           allowed = await isEmailAllowedAsync(next.email)
         } catch (err) {
           console.warn('초대 확인에 실패했습니다.', err)
-          // 확인 실패 시 로그인 화면에 머물게 해 재시도할 수 있게 한다.
           if (cancelled || runId !== generation) return
           setUser(null)
           setStatus('signedOut')
@@ -96,6 +106,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const signInWithGoogle = useCallback(async () => {
+    if (SKIP_AUTH_LOCALLY) {
+      setStatus('signedIn')
+      return
+    }
     if (!isFirebaseConfigured()) {
       setStatus('misconfigured')
       setError('Firebase 설정이 없습니다. 환경 변수를 확인해 주세요.')
@@ -125,6 +139,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const signOutUser = useCallback(async () => {
     setError('')
+    if (SKIP_AUTH_LOCALLY) {
+      setUser(null)
+      setStatus('signedIn')
+      return
+    }
     if (!isFirebaseConfigured()) {
       setUser(null)
       setStatus('misconfigured')
@@ -139,6 +158,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     status,
     user,
     error,
+    skipAuth: SKIP_AUTH_LOCALLY,
     signInWithGoogle,
     signOutUser,
   }), [status, user, error, signInWithGoogle, signOutUser])

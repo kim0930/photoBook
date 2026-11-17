@@ -631,8 +631,11 @@ export const useBookStore = create<BookState>((set, get) => ({
   updatePhotoFrame: (id, frame, commit = false, bringToFront = false) =>
     set((state) => {
       if (isPageCompleted(state, pageIdForPhoto(state, id))) return state
-      const currentPriority = Math.max(0, ...state.photos.map((photo) => photo.framePriority ?? 0))
       const page = state.pages.find((candidate) => candidate.photoIds.includes(id))
+      const pageIds = page?.photoIds ?? [id]
+      const currentPriority = bringToFront
+        ? Math.max(0, ...state.photos.filter((photo) => pageIds.includes(photo.id)).map((photo) => photo.framePriority ?? 0))
+        : 0
       const freeFrame = avoidObstacles(frame, lockedFrames(state.photos, page, id))
       const photos = state.photos.map((photo) =>
         photo.id === id
@@ -668,21 +671,38 @@ export const useBookStore = create<BookState>((set, get) => ({
       const page = state.pages.find((candidate) => candidate.photoIds.some((id) => entries.some((entry) => entry.id === id)))
       if (isPageCompleted(state, page?.id)) return state
       const byId = new Map(entries.map((entry) => [entry.id, entry.frame]))
-      const obstacles = lockedFrames(state.photos, page)
+      let changed = false
       const photos = state.photos.map((photo) => {
         const frame = byId.get(photo.id)
         if (!frame || photo.layoutLocked) return photo
-        return { ...photo, freeFrame: avoidObstacles(frame, obstacles), manuallyPositioned: true }
+        const prev = photo.freeFrame
+        if (
+          prev
+          && Math.abs(prev.x - frame.x) < 0.0001
+          && Math.abs(prev.y - frame.y) < 0.0001
+          && Math.abs(prev.width - frame.width) < 0.0001
+          && Math.abs(prev.height - frame.height) < 0.0001
+          && photo.manuallyPositioned
+        ) {
+          return photo
+        }
+        changed = true
+        return { ...photo, freeFrame: frame, manuallyPositioned: true }
       })
-      const layoutOverrides = page
+      if (!changed) return state
+      const needsLayout = Boolean(page && page.layoutId !== 'adaptive-flow')
+      const layoutOverrides = needsLayout && page
         ? { ...state.layoutOverrides, [page.id]: 'adaptive-flow' as LayoutId }
         : state.layoutOverrides
-      const pages = state.pages.map((candidate) =>
-        candidate.id === page?.id ? { ...candidate, layoutId: 'adaptive-flow' as LayoutId } : candidate,
-      )
+      const pages = needsLayout
+        ? state.pages.map((candidate) =>
+          candidate.id === page?.id ? { ...candidate, layoutId: 'adaptive-flow' as LayoutId } : candidate,
+        )
+        : state.pages
       if (commit) {
-        for (const photo of photos) {
-          if (!byId.has(photo.id) || photo.layoutLocked) continue
+        for (const entry of entries) {
+          const photo = photos.find((item) => item.id === entry.id)
+          if (!photo || photo.layoutLocked) continue
           void db.photos.update(photo.id, { freeFrame: photo.freeFrame, manuallyPositioned: true })
         }
       }
@@ -1234,7 +1254,16 @@ useBookStore.subscribe((state, previous) => {
       selectedPageId: state.selectedPageId,
       pageFrame: state.pageFrame,
     }, bookId)
-    void syncBookMetaFromPhotos(bookId, state.photos)
+    // 프레임 드래그처럼 사진 메타만 바뀐 경우 전체 연도/표지 재계산은 생략
+    if (
+      state.photos.length !== previous.photos.length
+      || state.photos.some((photo, index) => {
+        const before = previous.photos[index]
+        return !before || photo.id !== before.id || photo.omitted !== before.omitted || photo.inBook !== before.inBook
+      })
+    ) {
+      void syncBookMetaFromPhotos(bookId, state.photos)
+    }
   }, 280)
 })
 

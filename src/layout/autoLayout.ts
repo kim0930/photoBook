@@ -212,18 +212,14 @@ function photoScore(photo: Photo) {
   return (photo.quality ?? photo.analysis?.importance ?? 0.5) + (photo.size === 'large' ? 0.35 : photo.size === 'small' ? -0.2 : 0)
 }
 
-export function pickLayout(photos: Photo[], pageIndex = 0, revision = 0): LayoutId {
-  const count = photos.length
-  const key = hash(`${photos.map((photo) => photo.id).join('|')}-${pageIndex}-${revision}`)
-  const hasWideHero = photos[0] && photos[0].width / photos[0].height > 1.35
-  const options = availableLayouts(count).filter((id) => id !== 'adaptive-flow')
-  if (count === 2 && hasWideHero) return key % 2 ? 'duo-stack' : 'duo-banner'
-  if (count === 3 && hasWideHero) return key % 2 ? 'trio-band' : 'trio-footer'
-  return options[key % options.length]
+/** 자동 배치는 사진 비율을 살리는 adaptive-flow를 기본으로 쓴다. */
+export function pickLayout(photos: Photo[], _pageIndex = 0, _revision = 0): LayoutId {
+  if (photos.length <= 1) return 'adaptive-flow'
+  return 'adaptive-flow'
 }
 
 export function availableLayouts(count: number): LayoutId[] {
-  if (count <= 1) return ['solo-bleed', 'solo-frame', 'solo-banner']
+  if (count <= 1) return ['adaptive-flow', 'solo-bleed', 'solo-frame', 'solo-banner']
   if (count === 2) return ['adaptive-flow', 'duo-even', 'duo-editorial', 'duo-stack', 'duo-sidebar', 'duo-banner']
   if (count === 3) return ['adaptive-flow', 'trio-hero', 'trio-hero-right', 'trio-band', 'trio-footer', 'trio-column', 'trio-rows']
   if (count === 4) return ['adaptive-flow', 'quad-grid', 'quad-feature', 'quad-feature-right', 'quad-band', 'quad-footer', 'quad-columns']
@@ -260,6 +256,10 @@ export function computeAdaptiveLayout(
   function leafScore(photo: Photo, rect: AdaptiveRect) {
     const target = normAspect(photo)
     const actual = rect.width / Math.max(rect.height, 0.001)
+    const ratio = Math.max(actual / target, target / actual)
+    // cover 기준 잘림 비율 ≈ 1 - 1/ratio. 10% 이하면 거의 패널티 없음.
+    const crop = 1 - 1 / ratio
+    if (crop <= 0.1) return crop * crop * 0.25
     const mismatch = Math.abs(Math.log(actual / target))
     return mismatch * mismatch
   }
@@ -349,13 +349,12 @@ export function computeAdaptiveLayout(
     .filter((photo) => !photo.layoutLocked && photo.freeFrame)
     .sort((a, b) => (b.framePriority ?? 0) - (a.framePriority ?? 0) || a.id.localeCompare(b.id))
     .map((photo) => ({ id: photo.id, frame: clampFrame(photo.freeFrame!, 1) }))
-  const collides = anchored.some((item, index) => (
-    obstacles.some((obstacle) => overlapArea(item.frame, obstacle) > 0.0008)
-    || anchored.some((other, otherIndex) => otherIndex !== index && overlapArea(item.frame, other.frame) > 0.0008)
-  ))
-  const placed = collides
-    ? anchored.slice(0, 1).map((item) => ({ ...item, frame: avoidObstacles(item.frame, obstacles) }))
-    : anchored
+  // gutter로 맞춘 프레임처럼 페이지 사진이 모두 freeFrame을 가지면 그대로 신뢰한다.
+  // (겹침 시 한쪽만 남기면 상하 2장 gutter 드래그가 즉시 되돌아가 멈춘 것처럼 보인다.)
+  const completeManual = anchored.length > 0 && anchored.length + locked.length >= photos.length
+  const placed = completeManual
+    ? anchored
+    : placeAnchoredFrames(anchored, obstacles)
   const fixed = [...locked, ...placed]
   if (!fixed.length) {
     divide(photos, { x: 0, y: 0, width: 1, height: 1 })
@@ -527,6 +526,27 @@ function chooseFreeSplit(rect: AdaptiveRect, rawFraction: number, pageRatio: num
     if (!best || penalty < best.penalty) best = { horizontal, fraction, penalty }
   }
   return best ?? { horizontal: longSide, fraction: 0.5, penalty: 0 }
+}
+
+/** 고정 장애물을 피하면서, 서로 겹치는 freeFrame은 우선순위대로 최대한 유지한다. */
+function placeAnchoredFrames(
+  anchored: Array<{ id: string; frame: AdaptiveRect }>,
+  obstacles: AdaptiveRect[],
+) {
+  const placed: Array<{ id: string; frame: AdaptiveRect }> = []
+  const occupied = [...obstacles]
+  for (const item of anchored) {
+    if (!occupied.some((obstacle) => overlapArea(item.frame, obstacle) > 0.0008)) {
+      placed.push(item)
+      occupied.push(item.frame)
+      continue
+    }
+    // 한쪽을 버리지 않고 빈 칸에 맞춰 유지 → gutter/드래그 중 레이아웃이 튕기지 않음
+    const frame = avoidObstacles(item.frame, occupied)
+    placed.push({ ...item, frame })
+    occupied.push(frame)
+  }
+  return placed
 }
 
 function clampFrame(frame: AdaptiveRect, limit: number): AdaptiveRect {

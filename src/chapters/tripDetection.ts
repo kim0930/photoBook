@@ -17,6 +17,12 @@ function dateKey(photo: Photo) {
   return photo.capturedAt.slice(0, 10)
 }
 
+function monthOf(photo: Photo | undefined) {
+  if (!photo) return 0
+  const date = new Date(photo.capturedAt)
+  return Number.isNaN(date.getTime()) ? 0 : date.getMonth() + 1
+}
+
 function estimateHome(photos: Photo[]): [number, number] | undefined {
   const buckets = new Map<string, { lat: number; lon: number; count: number }>()
   for (const photo of photos) {
@@ -55,15 +61,46 @@ export async function placeName(lat: number, lon: number): Promise<string> {
   }
 }
 
+function tripPhotoIds(chapters: Chapter[]) {
+  const ids = new Set<string>()
+  for (const chapter of chapters) {
+    if (chapter.type !== 'trip') continue
+    for (const id of chapter.photoIds) ids.add(id)
+  }
+  return ids
+}
+
+function chapterMonth(chapter: Chapter, photosById: Map<string, Photo>) {
+  if (chapter.type === 'month' && chapter.month) return chapter.month
+  if (chapter.month) return chapter.month
+  return monthOf(photosById.get(chapter.photoIds[0]))
+}
+
+function sortChapters(chapters: Chapter[], photos: Photo[]) {
+  const photosById = new Map(photos.map((photo) => [photo.id, photo]))
+  return [...chapters].sort((a, b) => {
+    const aMonth = chapterMonth(a, photosById)
+    const bMonth = chapterMonth(b, photosById)
+    if (aMonth !== bMonth) return aMonth - bMonth
+    // 같은 달: 월 챕터 → 여행 챕터
+    if (a.type !== b.type) return a.type === 'month' ? -1 : 1
+    const aDate = photosById.get(a.photoIds[0])?.capturedAt ?? ''
+    const bDate = photosById.get(b.photoIds[0])?.capturedAt ?? ''
+    return aDate.localeCompare(bDate)
+  })
+}
+
 export async function buildChapters(photos: Photo[], thresholdKm = 50): Promise<Chapter[]> {
   const home = estimateHome(photos)
   const away = home
-    ? photos.filter(
-        (p) =>
-          p.latitude != null &&
-          p.longitude != null &&
-          distanceKm(home, [p.latitude, p.longitude]) >= thresholdKm,
-      )
+    ? photos
+        .filter(
+          (p) =>
+            p.latitude != null
+            && p.longitude != null
+            && distanceKm(home, [p.latitude, p.longitude]) >= thresholdKm,
+        )
+        .sort((a, b) => a.capturedAt.localeCompare(b.capturedAt))
     : []
 
   const tripGroups: Photo[][] = []
@@ -77,22 +114,6 @@ export async function buildChapters(photos: Photo[], thresholdKm = 50): Promise<
     else current.push(photo)
   }
 
-  const tripIds = new Set(tripGroups.flat().map((photo) => photo.id))
-  const monthChapters: Chapter[] = Array.from({ length: 12 }, (_, index) => {
-    const monthPhotos = photos.filter(
-      (photo) => new Date(photo.capturedAt).getMonth() === index && !tripIds.has(photo.id),
-    )
-    return {
-      id: `month-${index + 1}`,
-      type: 'month',
-      month: index + 1,
-      title: `${index + 1}월`,
-      photoIds: monthPhotos.map((photo) => photo.id),
-      note: '',
-      coverPhotoId: monthPhotos[0]?.id,
-    } satisfies Chapter
-  }).filter((chapter) => chapter.photoIds.length > 0)
-
   const trips = await Promise.all(
     tripGroups.map(async (group, index) => {
       const first = group[0]
@@ -103,7 +124,8 @@ export async function buildChapters(photos: Photo[], thresholdKm = 50): Promise<
           : '여행'
       return {
         id: `trip-${index}-${first.capturedAt}`,
-        type: 'trip',
+        type: 'trip' as const,
+        month: monthOf(first),
         title: `${destination} · ${dateKey(first).replaceAll('-', '.')} - ${dateKey(last).replaceAll('-', '.')}`,
         photoIds: group.map((photo) => photo.id),
         note: '',
@@ -112,32 +134,46 @@ export async function buildChapters(photos: Photo[], thresholdKm = 50): Promise<
     }),
   )
 
-  return ensureMonthChapters(photos, [...monthChapters, ...trips])
+  return ensureMonthChapters(photos, trips)
 }
 
+/**
+ * 월 챕터 = 여행에 안 들어간 사진만.
+ * 같은 달 안에서는 월 챕터 다음에 그달 여행 챕터가 오도록 정렬한다.
+ */
 export function ensureMonthChapters(photos: Photo[], chapters: Chapter[]) {
   const photoIds = new Set(photos.map((photo) => photo.id))
   const next = chapters
     .filter((chapter) => chapter.id !== 'year-book')
     .map((chapter) => ({
-    ...chapter,
-    photoIds: chapter.photoIds.filter((id) => {
-      const photo = photos.find((item) => item.id === id)
-      return photo && !photo.omitted
-    }),
-  }))
+      ...chapter,
+      photoIds: chapter.photoIds.filter((id) => {
+        const photo = photos.find((item) => item.id === id)
+        return photo && !photo.omitted
+      }),
+    }))
+
   for (const chapter of next) {
-    if (chapter.coverPhotoId && !photoIds.has(chapter.coverPhotoId)) chapter.coverPhotoId = chapter.photoIds[0]
+    if (chapter.type === 'trip' && !chapter.month) {
+      chapter.month = monthOf(photos.find((photo) => photo.id === chapter.photoIds[0]))
+    }
+    if (chapter.coverPhotoId && !photoIds.has(chapter.coverPhotoId)) {
+      chapter.coverPhotoId = chapter.photoIds[0]
+    }
   }
+
+  const claimedByTrip = tripPhotoIds(next)
   const byMonth = new Map<number, Photo[]>()
   for (const photo of [...photos].sort((a, b) => a.capturedAt.localeCompare(b.capturedAt))) {
     const date = new Date(photo.capturedAt)
     if (Number.isNaN(date.getTime()) || photo.omitted) continue
+    if (claimedByTrip.has(photo.id)) continue
     const month = date.getMonth() + 1
     const group = byMonth.get(month) ?? []
     group.push(photo)
     byMonth.set(month, group)
   }
+
   for (const [month, monthPhotos] of byMonth) {
     let chapter = next.find((item) => item.type === 'month' && item.month === month)
     if (!chapter) {
@@ -151,17 +187,14 @@ export function ensureMonthChapters(photos: Photo[], chapters: Chapter[]) {
       }
       next.push(chapter)
     }
-    const included = new Set(chapter.photoIds)
-    for (const photo of monthPhotos) {
-      if (!included.has(photo.id)) chapter.photoIds.push(photo.id)
+    // 여행에 쓰인 사진은 월 챕터에서 제외하고, 나머지 사진만 동기화
+    chapter.photoIds = monthPhotos.map((photo) => photo.id)
+    if (!chapter.coverManual || !chapter.coverPhotoId || !chapter.photoIds.includes(chapter.coverPhotoId)) {
+      chapter.coverPhotoId = chapter.photoIds[0]
     }
-    if (!chapter.coverPhotoId) chapter.coverPhotoId = chapter.photoIds[0]
   }
-  return next
-    .filter((chapter) => chapter.photoIds.length > 0)
-    .sort((a, b) => {
-      const aDate = photos.find((photo) => photo.id === a.photoIds[0])?.capturedAt ?? ''
-      const bDate = photos.find((photo) => photo.id === b.photoIds[0])?.capturedAt ?? ''
-      return aDate.localeCompare(bDate)
-    })
+
+  // 사진이 비게 된 월 챕터 제거 (여행만 있는 달은 여행 챕터만 남김)
+  const kept = next.filter((chapter) => chapter.photoIds.length > 0)
+  return sortChapters(kept, photos)
 }

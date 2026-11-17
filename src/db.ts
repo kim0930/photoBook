@@ -1,4 +1,5 @@
 import Dexie, { type EntityTable } from 'dexie'
+import { ensureMonthChapters } from './chapters/tripDetection'
 import type { BookCoverDesign, BookPage, Chapter, CurationSettings, DecorFrame, DrawStroke, FaceGroup, FlowAspect, PageCaption, PageMapWidget, PageNote, PageSticker, Photo } from './types'
 
 type StoredPhoto = Omit<Photo, 'url' | 'thumbUrl' | 'file' | 'movie'> & { thumbnail: Blob; bookId: string }
@@ -634,15 +635,18 @@ const PLACEHOLDER_THUMB =
 
 export async function loadLibrary(bookId = activeBookId): Promise<{ photos: Photo[]; chapters: Chapter[] }> {
   if (!bookId) return { photos: [], chapters: [] }
-  const [storedPhotos, chapters] = await Promise.all([
+  const [storedPhotos, storedChapters] = await Promise.all([
     db.photos.where('bookId').equals(bookId).toArray(),
     db.chapters.where('bookId').equals(bookId).toArray(),
   ])
   const photos = storedPhotos.map((row) => photoFromStored(row))
-  return {
-    photos,
-    chapters: chapters.map(({ bookId: _bookId, ...chapter }) => chapter),
+  const rawChapters = storedChapters.map(({ bookId: _bookId, ...chapter }) => chapter)
+  // 월/여행 사진 중복을 바로잡고, 같은 달 안에서는 월 → 여행 순으로 맞춘다.
+  const chapters = ensureMonthChapters(photos, rawChapters)
+  if (JSON.stringify(rawChapters) !== JSON.stringify(chapters)) {
+    void syncChapters(chapters, bookId)
   }
+  return { photos, chapters }
 }
 
 export async function loadBookWorkspace(bookId: string) {
